@@ -167,14 +167,17 @@ def create_backend(name: str, **kwargs) -> IsolationBackend:
 # Job launcher (uses a backend)
 # ---------------------------------------------------------------------------
 
-def _build_job_env(eventstore_api_key_env: str) -> dict[str, str]:
+def _build_job_env(
+    eventstore_api_key_env: str,
+    extra_env_keys: list[str] | None = None,
+) -> dict[str, str]:
     """Build minimal environment for a job subprocess."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": os.environ.get("HOME", "/tmp"),
         eventstore_api_key_env: os.environ.get(eventstore_api_key_env, ""),
     }
-    for key in ("ANTHROPIC_API_KEY", "GIT_TOKEN"):
+    for key in ("ANTHROPIC_API_KEY", "GIT_TOKEN", *(extra_env_keys or [])):
         val = os.environ.get(key)
         if val:
             env[key] = val
@@ -190,6 +193,7 @@ async def launch_job(
     repo: str,
     branch: str,
     evo_sha: str | None,
+    evo_repo_path: str,
     palimpsest_command: str,
     work_dir: Path,
     eventstore_url: str,
@@ -201,6 +205,11 @@ async def launch_job(
 ) -> JobProcess:
     job_dir = work_dir / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Palimpsest looks for evo/ relative to cwd — symlink it in.
+    evo_link = job_dir / "evo"
+    if not evo_link.exists():
+        evo_link.symlink_to(Path(evo_repo_path).resolve())
 
     config = {
         "job_id": job_id,
@@ -223,7 +232,13 @@ async def launch_job(
     config_path = job_dir / "config.yaml"
     config_path.write_text(yaml.dump(config, default_flow_style=False))
 
-    env = _build_job_env(eventstore_api_key_env)
+    # Forward the LLM API key env var to the subprocess
+    extra_env = []
+    llm_key_env = llm_defaults.get("api_key_env") if llm_defaults else None
+    if llm_key_env:
+        extra_env.append(llm_key_env)
+
+    env = _build_job_env(eventstore_api_key_env, extra_env_keys=extra_env)
     command = [palimpsest_command, "run", str(config_path)]
 
     proc = await backend.launch(command, cwd=job_dir, env=env)

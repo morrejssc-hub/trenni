@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Runtime data
+trenni-work/
+smoke-work/
+trenni-config.yaml
+*.db

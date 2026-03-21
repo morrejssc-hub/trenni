@@ -100,6 +100,12 @@ class Supervisor:
         )
         if next_cursor:
             self.event_cursor = next_cursor
+        elif events:
+            # Pasloe only returns X-Next-Cursor when result count == limit.
+            # Build our own cursor from the last event so we don't re-poll
+            # the same batch next cycle.
+            last = events[-1]
+            self.event_cursor = f"{last.ts.isoformat()}|{last.id}"
 
         for event in events:
             try:
@@ -277,6 +283,7 @@ class Supervisor:
             repo=repo,
             branch=branch,
             evo_sha=evo_sha,
+            evo_repo_path=self.config.evo_repo_path,
             palimpsest_command=self.config.palimpsest_command,
             work_dir=Path(self.config.work_dir),
             eventstore_url=self.config.eventstore_url,
