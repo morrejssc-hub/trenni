@@ -1,8 +1,17 @@
-"""Core supervisor: event polling loop + job launcher."""
+"""Core supervisor: event polling loop + job launcher.
+
+Unified spawn model: all jobs are SpawnedJob instances, differing only
+in their ``depends_on`` set.  Jobs with no dependencies go straight to
+the ready queue; jobs with dependencies wait in ``_pending`` until all
+prerequisites complete.  This replaces the separate ForkJoin + TaskItem
+structures.
+"""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -15,23 +24,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ForkJoin:
-    parent_job_id: str
-    spawn_event: Event
-    child_ids: list[str]
-    completed: set[str] = field(default_factory=set)
-
-
-@dataclass
-class TaskItem:
-    """A queued task waiting to be launched."""
-    source_event_id: str   # originating task.submit event id
-    job_id: str            # pre-assigned at enqueue time
+class SpawnedJob:
+    """A job recognised by the supervisor, possibly waiting on dependencies."""
+    job_id: str
+    source_event_id: str
     task: str
     role: str
     repo: str
     init_branch: str
     evo_sha: str | None
+    depends_on: frozenset[str] = field(default_factory=frozenset)
+
+
+# Number of poll cycles between checkpoints (checkpoint_interval * poll_interval seconds).
+_DEFAULT_CHECKPOINT_CYCLES = 30          # ~60 s at default 2 s poll
+_DEFAULT_REAP_TIMEOUT_S = 120.0
 
 
 class Supervisor:
@@ -52,13 +59,20 @@ class Supervisor:
 
         # In-memory state
         self.event_cursor: str | None = None
-        self.jobs: dict[str, JobProcess] = {}       # job_id -> process
-        self.fork_joins: dict[str, ForkJoin] = {}   # parent_job_id -> ForkJoin
+        self.jobs: dict[str, JobProcess] = {}           # job_id → running process
 
-        # Task queue — unbounded (add maxsize= here when backpressure is needed)
-        self._task_queue: asyncio.Queue[TaskItem] = asyncio.Queue()
-        # Event IDs of task.submit events already enqueued or skipped (dedup guard)
+        # Unified spawn state
+        self._ready_queue: asyncio.Queue[SpawnedJob] = asyncio.Queue()
+        self._pending: dict[str, SpawnedJob] = {}       # job_id → waiting for deps
+        self._completed_jobs: set[str] = set()          # terminal job_ids
+        self._job_summaries: dict[str, str] = {}        # job_id → summary text
+
+        # Dedup guard for source events (task.submit / spawn request)
         self._launched_event_ids: set[str] = set()
+
+        # Checkpoint config
+        self._checkpoint_cycles = _DEFAULT_CHECKPOINT_CYCLES
+        self._reap_timeout = _DEFAULT_REAP_TIMEOUT_S
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -108,37 +122,45 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
+        polls_since_checkpoint = 0
         while self.running:
             try:
                 await self._poll_and_handle()
             except Exception:
                 logger.exception("Error in poll cycle")
 
-            self._reap_processes()
+            self._mark_exited_processes()
+
+            polls_since_checkpoint += 1
+            if polls_since_checkpoint >= self._checkpoint_cycles:
+                await self._checkpoint()
+                polls_since_checkpoint = 0
 
             await asyncio.sleep(self.config.poll_interval)
 
     async def _drain_queue(self) -> None:
-        """Background coroutine: dequeue TaskItems and launch when capacity allows."""
+        """Background coroutine: dequeue SpawnedJobs and launch when capacity allows."""
         while True:
-            item = await self._task_queue.get()
+            job = await self._ready_queue.get()
             while not self._has_capacity():
                 await asyncio.sleep(1.0)
             try:
-                await self._launch_from_item(item)
+                await self._launch_from_spawned(job)
             except Exception:
-                logger.exception("Failed to launch queued job %s, dropping (recoverable on restart)", item.job_id)
+                logger.exception(
+                    "Failed to launch queued job %s, dropping (recoverable on restart)",
+                    job.job_id,
+                )
 
-    async def _launch_from_item(self, item: TaskItem) -> None:
-        """Launch a TaskItem as a palimpsest job."""
+    async def _launch_from_spawned(self, job: SpawnedJob) -> None:
         await self._launch(
-            job_id=item.job_id,
-            task=item.task,
-            role=item.role,
-            repo=item.repo,
-            init_branch=item.init_branch,
-            evo_sha=item.evo_sha,
-            source_event_id=item.source_event_id,
+            job_id=job.job_id,
+            task=job.task,
+            role=job.role,
+            repo=job.repo,
+            init_branch=job.init_branch,
+            evo_sha=job.evo_sha,
+            source_event_id=job.source_event_id,
         )
 
     async def _poll_and_handle(self) -> None:
@@ -149,9 +171,6 @@ class Supervisor:
         if next_cursor:
             self.event_cursor = next_cursor
         elif events:
-            # Pasloe only returns X-Next-Cursor when result count == limit.
-            # Build our own cursor from the last event so we don't re-poll
-            # the same batch next cycle.
             last = events[-1]
             self.event_cursor = f"{last.ts.isoformat()}|{last.id}"
 
@@ -177,86 +196,104 @@ class Supervisor:
                 self._handle_job_started(event)
 
     # ------------------------------------------------------------------
-    # task.submit -> launch job
+    # task.submit → enqueue
     # ------------------------------------------------------------------
 
     async def _handle_task_submit(self, event: Event) -> None:
-        # Dedup: skip events already enqueued or completed
         if event.id in self._launched_event_ids:
             logger.debug("Skipping already-processed task.submit %s", event.id)
             return
 
         data = event.data
         task = data.get("task", "")
-        role = data.get("role", "default")
-        repo = data.get("repo", "")
-        init_branch = data.get("init_branch", "main")
-        evo_sha = data.get("evo_sha")
-
         if not task:
             logger.warning("Ignoring task.submit with empty task (event=%s)", event.id)
             return
 
-        job_id = self._generate_job_id()
         self._launched_event_ids.add(event.id)
 
-        item = TaskItem(
+        job = SpawnedJob(
+            job_id=self._generate_job_id(),
             source_event_id=event.id,
-            job_id=job_id,
             task=task,
-            role=role,
-            repo=repo,
-            init_branch=init_branch,
-            evo_sha=evo_sha,
+            role=data.get("role", "default"),
+            repo=data.get("repo", ""),
+            init_branch=data.get("init_branch", "main"),
+            evo_sha=data.get("evo_sha"),
         )
-        await self._task_queue.put(item)
-        logger.info("Queued task %s (job_id=%s, queue_size=%d)",
-                    event.id, job_id, self._task_queue.qsize())
+        await self._enqueue(job)
+        logger.info(
+            "Queued task %s (job_id=%s, queue_size=%d)",
+            event.id, job.job_id, self._ready_queue.qsize(),
+        )
 
     # ------------------------------------------------------------------
-    # job.spawn.request -> fork-join
+    # job.spawn.request → children (immediate) + continuation (pending)
     # ------------------------------------------------------------------
 
     async def _handle_spawn(self, event: Event) -> None:
         data = event.data
         parent_job_id = data.get("job_id", "")
         tasks = data.get("tasks", [])
-        evo_sha = None
 
         if not tasks:
             logger.warning("Empty spawn request from job %s", parent_job_id)
             return
 
+        evo_sha: str | None = None
         child_ids: list[str] = []
-        for i, child_task in enumerate(tasks):
+
+        for i, child_def in enumerate(tasks):
             child_id = f"{parent_job_id}-c{i}"
             child_ids.append(child_id)
 
-            # Use role_sha from spawn if present, else latest
-            evo_sha = child_task.get("role_sha", evo_sha)
-            role_file = child_task.get("role_file", "")
-            # Extract role name from "roles/foo.py" -> "foo"
+            evo_sha = child_def.get("role_sha", evo_sha)
+            role_file = child_def.get("role_file", "")
             role = role_file.replace("roles/", "").replace(".py", "") if role_file else "default"
 
-            child_task_str = child_task.get("task", "")
-            repo = child_task.get("repo", "")
-            branch = child_task.get("branch", "main")
+            child = SpawnedJob(
+                job_id=child_id,
+                source_event_id=event.id,
+                task=child_def.get("task", ""),
+                role=role,
+                repo=child_def.get("repo", ""),
+                init_branch=child_def.get("branch", "main"),
+                evo_sha=evo_sha,
+            )
+            await self._enqueue(child)
 
-            if self._has_capacity():
-                await self._launch(child_id, child_task_str, role, repo, branch, evo_sha)
-            else:
-                logger.info("At capacity, cannot launch child %s", child_id)
+        # Continuation job — depends on all children
+        continuation = SpawnedJob(
+            job_id=f"{parent_job_id}-join",
+            source_event_id=event.id,
+            task="",                          # filled by _build_continuation on resolve
+            role="default",
+            repo=data.get("repo", ""),
+            init_branch=data.get("branch", "main"),
+            evo_sha=evo_sha,
+            depends_on=frozenset(child_ids),
+        )
+        await self._enqueue(continuation)
 
-        self.fork_joins[parent_job_id] = ForkJoin(
-            parent_job_id=parent_job_id,
-            spawn_event=event,
-            child_ids=child_ids,
+        logger.info(
+            "Spawn: parent=%s children=%s continuation=%s",
+            parent_job_id, child_ids, continuation.job_id,
         )
 
-        logger.info("Fork-join created: parent=%s children=%s", parent_job_id, child_ids)
+    # ------------------------------------------------------------------
+    # Unified enqueue
+    # ------------------------------------------------------------------
+
+    async def _enqueue(self, job: SpawnedJob) -> None:
+        """Route a job to ready queue or pending table based on dependencies."""
+        unsatisfied = job.depends_on - self._completed_jobs
+        if not unsatisfied:
+            await self._ready_queue.put(job)
+        else:
+            self._pending[job.job_id] = job
 
     # ------------------------------------------------------------------
-    # job.completed / job.failed -> check fork-join
+    # job.completed / job.failed → resolve dependencies
     # ------------------------------------------------------------------
 
     async def _handle_job_done(self, event: Event) -> None:
@@ -264,56 +301,79 @@ class Supervisor:
         status = "completed" if event.type == "job.completed" else "failed"
         logger.info("Job %s %s", job_id, status)
 
-        # Remove from running processes
         self.jobs.pop(job_id, None)
+        self._completed_jobs.add(job_id)
+        self._job_summaries[job_id] = event.data.get("summary", "")
 
-        # Check fork-join membership
-        for parent_id, fj in list(self.fork_joins.items()):
-            if job_id in fj.child_ids:
-                fj.completed.add(job_id)
-                logger.info(
-                    "Fork-join %s: %d/%d children done",
-                    parent_id, len(fj.completed), len(fj.child_ids),
-                )
-                if fj.completed >= set(fj.child_ids):
-                    await self._resolve_fork_join(parent_id, fj)
-                    del self.fork_joins[parent_id]
-                break
+        # Scan pending jobs whose dependencies may now be satisfied
+        newly_ready: list[str] = []
+        for pending_id, pending_job in list(self._pending.items()):
+            unsatisfied = pending_job.depends_on - self._completed_jobs
+            if not unsatisfied:
+                if not pending_job.task:
+                    pending_job = self._build_continuation(pending_job)
+                newly_ready.append(pending_id)
+                await self._ready_queue.put(pending_job)
 
-    async def _resolve_fork_join(self, parent_id: str, fj: ForkJoin) -> None:
-        logger.info("Fork-join resolved for parent %s, launching continuation", parent_id)
+        for jid in newly_ready:
+            del self._pending[jid]
 
-        # Query child completion events for context
-        child_summaries = []
-        for child_id in fj.child_ids:
-            events, _ = await self.client.poll(
-                source=self.config.default_eventstore_source,
-            )
-            # Find completion events for this child
-            for ev in events:
-                if ev.data.get("job_id") == child_id and ev.type == "job.completed":
-                    child_summaries.append(
-                        f"- {child_id}: {ev.data.get('summary', '(no summary)')}"
-                    )
-                    break
-            else:
-                child_summaries.append(f"- {child_id}: (completed, no summary found)")
+    def _build_continuation(self, job: SpawnedJob) -> SpawnedJob:
+        """Populate the continuation task text from child summaries."""
+        lines: list[str] = []
+        for child_id in sorted(job.depends_on):
+            summary = self._job_summaries.get(child_id, "(no summary)")
+            lines.append(f"- {child_id}: {summary}")
 
-        # Build continuation task
-        original_data = fj.spawn_event.data
-        continuation_task = (
-            f"Continue after child tasks completed.\n\n"
-            f"Child results:\n" + "\n".join(child_summaries)
+        return dataclasses.replace(
+            job,
+            task="Continue after child tasks completed.\n\nChild results:\n" + "\n".join(lines),
         )
 
-        continuation_id = f"{parent_id}-r1"
-        repo = original_data.get("repo", "")
-        branch = original_data.get("branch", "main")
+    # ------------------------------------------------------------------
+    # Checkpoint + reap
+    # ------------------------------------------------------------------
 
-        if self._has_capacity():
-            await self._launch(continuation_id, continuation_task, "default", repo, branch, None)
-        else:
-            logger.info("At capacity, cannot launch continuation %s", continuation_id)
+    def _mark_exited_processes(self) -> None:
+        """Record the first-observed exit time for finished processes."""
+        now = time.monotonic()
+        for jp in self.jobs.values():
+            if jp.proc.returncode is not None and jp.exited_at is None:
+                jp.exited_at = now
+                logger.info("Process for job %s exited (rc=%d)", jp.job_id, jp.proc.returncode)
+
+    async def _checkpoint(self) -> None:
+        """Periodic maintenance: reap dead slots, emit checkpoint anchor."""
+        now = time.monotonic()
+        reaped: list[str] = []
+        for job_id, jp in list(self.jobs.items()):
+            if jp.exited_at is not None and (now - jp.exited_at) > self._reap_timeout:
+                logger.warning(
+                    "Job %s process exited %ds ago without terminal event, "
+                    "emitting compensating failure",
+                    job_id, int(now - jp.exited_at),
+                )
+                await self.client.emit("job.failed", {
+                    "job_id": job_id,
+                    "error": f"Process exited (rc={jp.proc.returncode}) without emitting terminal event",
+                    "code": "process_lost",
+                })
+                reaped.append(job_id)
+
+        for job_id in reaped:
+            del self.jobs[job_id]
+
+        await self.client.emit("supervisor.checkpoint", {
+            "cursor": self.event_cursor,
+            "running_jobs": list(self.jobs.keys()),
+            "pending_jobs": list(self._pending.keys()),
+            "ready_queue_size": self._ready_queue.qsize(),
+            "completed_count": len(self._completed_jobs),
+        })
+
+    # ------------------------------------------------------------------
+    # Replay on startup
+    # ------------------------------------------------------------------
 
     async def _fetch_all(
         self,
@@ -321,7 +381,7 @@ class Supervisor:
         source: str | None = None,
     ) -> list[Event]:
         """Fetch all Pasloe events of a given type, paginating until exhausted."""
-        results = []
+        results: list[Event] = []
         cursor = None
         while True:
             events, next_cursor = await self.client.poll(
@@ -337,10 +397,20 @@ class Supervisor:
         return results
 
     async def _replay_unfinished_tasks(self) -> None:
-        """On startup: replay Pasloe history to recover unfinished tasks into the queue."""
+        """On startup: replay Pasloe history to recover unfinished tasks."""
         logger.info("Replaying unfinished tasks from Pasloe...")
 
-        # 1–4: load all relevant event sets
+        # Try to resume from latest checkpoint
+        checkpoints = await self._fetch_all(
+            "supervisor.checkpoint", source=self.config.source_id
+        )
+        replay_cursor: str | None = None
+        if checkpoints:
+            latest_cp = checkpoints[-1]
+            replay_cursor = latest_cp.data.get("cursor")
+            logger.info("Found checkpoint, replay from cursor=%s", replay_cursor)
+
+        # Fetch relevant event sets
         launched_events = await self._fetch_all(
             "supervisor.job.launched", source=self.config.source_id
         )
@@ -349,26 +419,43 @@ class Supervisor:
         failed_events = await self._fetch_all("job.failed")
         submit_events = await self._fetch_all("task.submit")
 
-        # Build lookup sets
-        # source_event_id → job_id (only events with source_event_id set)
+        # Build lookup maps
         launched_map: dict[str, str] = {
             e.data["source_event_id"]: e.data["job_id"]
             for e in launched_events
             if e.data.get("source_event_id")
         }
-        started_job_ids: set[str] = {e.data["job_id"] for e in started_events if e.data.get("job_id")}
+        started_job_ids: set[str] = {
+            e.data["job_id"] for e in started_events if e.data.get("job_id")
+        }
         finished_job_ids: set[str] = {
-            e.data["job_id"] for e in (completed_events + failed_events) if e.data.get("job_id")
+            e.data["job_id"]
+            for e in (completed_events + failed_events)
+            if e.data.get("job_id")
         }
 
-        # 5: find globally latest event for cursor initialization
-        all_events = launched_events + started_events + completed_events + failed_events + submit_events
-        latest = max(all_events, key=lambda e: (e.ts, e.id), default=None)
-        if latest:
-            self.event_cursor = f"{latest.ts.isoformat()}|{latest.id}"
-            logger.info("Replay cursor initialized to %s", self.event_cursor)
+        # Populate _completed_jobs and _job_summaries from history
+        for e in completed_events:
+            jid = e.data.get("job_id", "")
+            if jid:
+                self._completed_jobs.add(jid)
+                self._job_summaries[jid] = e.data.get("summary", "")
+        for e in failed_events:
+            jid = e.data.get("job_id", "")
+            if jid:
+                self._completed_jobs.add(jid)
 
-        # 6: classify each task.submit
+        # Initialise cursor to latest event
+        all_events = launched_events + started_events + completed_events + failed_events + submit_events
+        if replay_cursor:
+            self.event_cursor = replay_cursor
+        else:
+            latest = max(all_events, key=lambda e: (e.ts, e.id), default=None)
+            if latest:
+                self.event_cursor = f"{latest.ts.isoformat()}|{latest.id}"
+        logger.info("Replay cursor set to %s", self.event_cursor)
+
+        # Classify each task.submit
         enqueued = skipped = orphans = 0
         for event in submit_events:
             data = event.data
@@ -383,48 +470,41 @@ class Supervisor:
                 job_finished = job_id_from_launch in finished_job_ids
 
                 if job_started and job_finished:
-                    # Complete — skip
                     self._launched_event_ids.add(event.id)
                     skipped += 1
                     continue
 
                 if not job_started and not job_finished:
                     if job_id_from_launch in self.jobs:
-                        # Process alive — skip
                         self._launched_event_ids.add(event.id)
                         skipped += 1
                         continue
-                    # Launched but never started and not running — re-enqueue
 
                 if job_started and not job_finished:
                     if job_id_from_launch in self.jobs:
-                        # Still running — skip
                         self._launched_event_ids.add(event.id)
                         skipped += 1
                         continue
-                    # Orphan — started but no terminal event and process gone
                     logger.warning(
-                        "Orphaned job %s (task.submit=%s): started but no terminal event. "
-                        "TODO: emit compensating event.",
+                        "Orphaned job %s (task.submit=%s): started but no terminal event.",
                         job_id_from_launch, event.id,
                     )
                     orphans += 1
-                    pass  # TODO: emit compensating event
                     continue
 
             # Not launched, or launched-not-started with dead process → re-enqueue
             new_job_id = self._generate_job_id()
             self._launched_event_ids.add(event.id)
-            item = TaskItem(
+            job = SpawnedJob(
                 source_event_id=event.id,
                 job_id=new_job_id,
                 task=task,
                 role=data.get("role", "default"),
                 repo=data.get("repo", ""),
-                branch=data.get("branch", "main"),
+                init_branch=data.get("init_branch", data.get("branch", "main")),
                 evo_sha=data.get("evo_sha"),
             )
-            await self._task_queue.put(item)
+            await self._enqueue(job)
             enqueued += 1
 
         logger.info(
@@ -433,7 +513,7 @@ class Supervisor:
         )
 
     # ------------------------------------------------------------------
-    # job.started -> evo hard gate (just log for now)
+    # job.started → evo hard gate (just log for now)
     # ------------------------------------------------------------------
 
     def _handle_job_started(self, event: Event) -> None:
@@ -489,18 +569,6 @@ class Supervisor:
     def _has_capacity(self) -> bool:
         return len(self.jobs) < self.config.max_workers
 
-    def _reap_processes(self) -> None:
-        for job_id, jp in list(self.jobs.items()):
-            if jp.proc.returncode is not None:
-                logger.info(
-                    "Process for job %s exited (rc=%d)",
-                    job_id, jp.proc.returncode,
-                )
-                # Don't remove from self.jobs here — wait for the
-                # authoritative job.completed/job.failed event from Pasloe.
-                # But if the process exited without emitting events,
-                # we'll eventually notice and clean up.
-
     def _generate_job_id(self) -> str:
         import uuid_utils
         return str(uuid_utils.uuid7())
@@ -511,5 +579,6 @@ class Supervisor:
             "running": self.running,
             "running_jobs": len(self.jobs),
             "max_workers": self.config.max_workers,
-            "fork_joins_active": len(self.fork_joins),
+            "pending_jobs": len(self._pending),
+            "ready_queue_size": self._ready_queue.qsize(),
         }
