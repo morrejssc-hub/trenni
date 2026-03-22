@@ -191,7 +191,7 @@ async def launch_job(
     task: str,
     role: str,
     repo: str,
-    branch: str,
+    init_branch: str,
     evo_sha: str | None,
     evo_repo_path: str,
     palimpsest_command: str,
@@ -217,7 +217,7 @@ async def launch_job(
         "role": role,
         "workspace": {
             "repo": repo,
-            "branch": branch,
+            "init_branch": init_branch,
             **workspace_defaults,
         },
         "llm": {**llm_defaults} if llm_defaults else {},

@@ -30,7 +30,7 @@ class TaskItem:
     task: str
     role: str
     repo: str
-    branch: str
+    init_branch: str
     evo_sha: str | None
 
 
@@ -136,7 +136,7 @@ class Supervisor:
             task=item.task,
             role=item.role,
             repo=item.repo,
-            branch=item.branch,
+            init_branch=item.init_branch,
             evo_sha=item.evo_sha,
             source_event_id=item.source_event_id,
         )
@@ -190,7 +190,7 @@ class Supervisor:
         task = data.get("task", "")
         role = data.get("role", "default")
         repo = data.get("repo", "")
-        branch = data.get("branch", "main")
+        init_branch = data.get("init_branch", "main")
         evo_sha = data.get("evo_sha")
 
         if not task:
@@ -206,7 +206,7 @@ class Supervisor:
             task=task,
             role=role,
             repo=repo,
-            branch=branch,
+            init_branch=init_branch,
             evo_sha=evo_sha,
         )
         await self._task_queue.put(item)
@@ -447,7 +447,7 @@ class Supervisor:
 
     async def _launch(
         self, job_id: str, task: str, role: str,
-        repo: str, branch: str, evo_sha: str | None,
+        repo: str, init_branch: str, evo_sha: str | None,
         source_event_id: str = "",
     ) -> None:
         logger.info("Launching job %s (role=%s, source=%s)", job_id, role, source_event_id or "?")
@@ -458,7 +458,7 @@ class Supervisor:
             task=task,
             role=role,
             repo=repo,
-            branch=branch,
+            init_branch=init_branch,
             evo_sha=evo_sha,
             evo_repo_path=self.config.evo_repo_path,
             palimpsest_command=self.config.palimpsest_command,
