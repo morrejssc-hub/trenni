@@ -311,3 +311,42 @@ async def test_replay_reenqueues_launched_not_started():
     sup._fetch_all = fake_fetch_all
     await sup._replay_unfinished_tasks()
     assert sup._task_queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_start_calls_replay_and_drain():
+    from unittest.mock import AsyncMock, patch
+    from trenni.supervisor import Supervisor
+    from trenni.config import TrenniConfig
+
+    sup = Supervisor(TrenniConfig())
+
+    replay_called = False
+
+    async def fake_replay():
+        nonlocal replay_called
+        replay_called = True
+
+    sup._replay_unfinished_tasks = fake_replay
+
+    # Patch _run_loop to return immediately so start() doesn't loop forever
+    with patch.object(sup, "_run_loop", new_callable=AsyncMock) as mock_run_loop, \
+         patch.object(sup.client, "register_source", new_callable=AsyncMock), \
+         patch.object(sup.client, "close", new_callable=AsyncMock), \
+         patch("asyncio.create_task") as mock_create_task:
+
+        async def _noop(): pass
+
+        class AwaitableTask(AsyncMock):
+            def __await__(self):
+                return _noop().__await__()
+
+        mock_task = AwaitableTask()
+        mock_create_task.return_value = mock_task
+
+        await sup.start()
+
+    assert replay_called
+    mock_run_loop.assert_called_once()
+    mock_create_task.assert_called_once()
+    mock_task.cancel.assert_called_once()

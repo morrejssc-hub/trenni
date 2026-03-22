@@ -76,12 +76,20 @@ class Supervisor:
         await self.client.register_source()
         logger.info("Registered source '%s' with Pasloe", self.config.source_id)
 
+        await self._replay_unfinished_tasks()
+
+        drain_task = asyncio.create_task(self._drain_queue())
         try:
             await self._run_loop()
         except asyncio.CancelledError:
             logger.info("Supervisor loop cancelled")
         finally:
             self.running = False
+            drain_task.cancel()
+            try:
+                await drain_task
+            except asyncio.CancelledError:
+                pass
             await self.client.close()
 
     async def stop(self, force: bool = False) -> None:
