@@ -81,5 +81,27 @@ class PasloeClient:
         ]
         return events, next_cursor
 
+    async def register_webhook(
+        self,
+        url: str,
+        secret: str = "",
+        event_types: list[str] | None = None,
+    ) -> str:
+        """Register (or update) a webhook. Returns webhook ID."""
+        resp = await self._client.post(
+            "/webhooks",
+            json={
+                "url": url,
+                "secret": secret,
+                "event_types": event_types or [],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        resp = await self._client.delete(f"/webhooks/{webhook_id}")
+        resp.raise_for_status()
+
     async def close(self) -> None:
         await self._client.aclose()

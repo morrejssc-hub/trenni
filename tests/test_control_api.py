@@ -81,3 +81,26 @@ class TestWebhookIntake:
             "ts": datetime.utcnow().isoformat(), "data": {},
         })
         assert r.status_code == 200
+
+
+class TestWebhookSignature:
+    async def test_valid_signature_accepted(self, client, supervisor):
+        import hashlib, hmac as _hmac, json
+        supervisor.config.webhook_secret = "test-secret"
+        payload = {"id": "e2", "source_id": "s", "type": "job.completed",
+                   "ts": datetime.utcnow().isoformat(), "data": {}}
+        body = json.dumps(payload).encode()
+        sig = "sha256=" + _hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+        supervisor._handle_event = AsyncMock()
+        r = await client.post("/hooks/events", content=body,
+                              headers={"Content-Type": "application/json",
+                                       "X-Pasloe-Signature": sig})
+        assert r.status_code == 200
+
+    async def test_invalid_signature_rejected(self, client, supervisor):
+        supervisor.config.webhook_secret = "test-secret"
+        r = await client.post("/hooks/events",
+                              json={"id": "e3", "source_id": "s", "type": "job.failed",
+                                    "ts": datetime.utcnow().isoformat(), "data": {}},
+                              headers={"X-Pasloe-Signature": "sha256=badhex"})
+        assert r.status_code == 401

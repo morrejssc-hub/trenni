@@ -78,6 +78,10 @@ class Supervisor:
         self._checkpoint_cycles = _DEFAULT_CHECKPOINT_CYCLES
         self._reap_timeout = _DEFAULT_REAP_TIMEOUT_S
 
+        # Webhook state
+        self._webhook_id: str | None = None
+        self._webhook_active: bool = False
+
     @property
     def paused(self) -> bool:
         return not self._resume_event.is_set()
@@ -99,6 +103,7 @@ class Supervisor:
         logger.info("Registered source '%s' with Pasloe", self.config.source_id)
 
         await self._replay_unfinished_tasks()
+        await self._try_register_webhook()
 
         drain_task = asyncio.create_task(self._drain_queue())
         try:
@@ -117,6 +122,12 @@ class Supervisor:
     async def stop(self, force: bool = False) -> None:
         logger.info("Supervisor stopping (force=%s)", force)
         self.running = False
+        if self._webhook_id:
+            try:
+                await self.client.delete_webhook(self._webhook_id)
+                logger.info("Deregistered webhook %s", self._webhook_id)
+            except Exception as exc:
+                logger.warning("Could not deregister webhook: %s", exc)
         if force:
             for job_id, jp in list(self.jobs.items()):
                 logger.warning("Force-killing job %s (pid=%d)", job_id, jp.proc.pid)
@@ -141,6 +152,29 @@ class Supervisor:
         except Exception:
             logger.warning("Could not emit supervisor.resumed event")
 
+    async def _try_register_webhook(self) -> None:
+        """Best-effort webhook registration. Falls back to polling on failure."""
+        url = self.config.trenni_webhook_url
+        if not url:
+            return
+        try:
+            self._webhook_id = await self.client.register_webhook(
+                url=url,
+                secret=self.config.webhook_secret,
+                event_types=["task.submit", "job.spawn.request",
+                             "job.completed", "job.failed", "job.started"],
+            )
+            self._webhook_active = True
+            logger.info(
+                "Registered webhook (id=%s) → %s (poll fallback every %.0fs)",
+                self._webhook_id, url, self.config.webhook_poll_interval,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not register webhook with Pasloe (%s) — falling back to pure polling",
+                exc,
+            )
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -160,7 +194,12 @@ class Supervisor:
                 await self._checkpoint()
                 polls_since_checkpoint = 0
 
-            await asyncio.sleep(self.config.poll_interval)
+            interval = (
+                self.config.webhook_poll_interval
+                if self._webhook_active
+                else self.config.poll_interval
+            )
+            await asyncio.sleep(interval)
 
     async def _drain_queue(self) -> None:
         """Background coroutine: dequeue SpawnedJobs and launch when capacity allows."""

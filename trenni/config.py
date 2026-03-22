@@ -34,6 +34,16 @@ class TrenniConfig:
     api_host: str = "127.0.0.1"
     api_port: int = 8100
 
+    # Webhook config — Trenni registers itself with Pasloe on startup
+    webhook_secret: str = ""          # HMAC secret; empty = unsigned (OK on localhost)
+    trenni_public_url: str = ""       # Override if not reachable at api_host:api_port
+    webhook_poll_interval: float = 30.0  # Fallback poll interval when webhook active
+
+    @property
+    def trenni_webhook_url(self) -> str:
+        base = self.trenni_public_url or f"http://{self.api_host}:{self.api_port}"
+        return f"{base}/hooks/events"
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> TrenniConfig:
         with open(path) as f:
