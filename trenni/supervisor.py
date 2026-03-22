@@ -150,6 +150,11 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     async def _handle_task_submit(self, event: Event) -> None:
+        # Dedup: skip events already enqueued or completed
+        if event.id in self._launched_event_ids:
+            logger.debug("Skipping already-processed task.submit %s", event.id)
+            return
+
         data = event.data
         task = data.get("task", "")
         role = data.get("role", "default")
@@ -162,14 +167,20 @@ class Supervisor:
             return
 
         job_id = self._generate_job_id()
+        self._launched_event_ids.add(event.id)
 
-        if not self._has_capacity():
-            logger.info("At capacity (%d/%d), deferring job %s",
-                        len(self.jobs), self.config.max_workers, job_id)
-            # TODO: queue for later. For now, log and skip.
-            return
-
-        await self._launch(job_id, task, role, repo, branch, evo_sha)
+        item = TaskItem(
+            source_event_id=event.id,
+            job_id=job_id,
+            task=task,
+            role=role,
+            repo=repo,
+            branch=branch,
+            evo_sha=evo_sha,
+        )
+        await self._task_queue.put(item)
+        logger.info("Queued task %s (job_id=%s, queue_size=%d)",
+                    event.id, job_id, self._task_queue.qsize())
 
     # ------------------------------------------------------------------
     # job.spawn.request -> fork-join
