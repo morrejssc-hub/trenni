@@ -110,6 +110,28 @@ class Supervisor:
 
             await asyncio.sleep(self.config.poll_interval)
 
+    async def _drain_queue(self) -> None:
+        """Background coroutine: dequeue TaskItems and launch when capacity allows."""
+        while True:
+            item = await self._task_queue.get()
+            while not self._has_capacity():
+                await asyncio.sleep(1.0)
+            try:
+                await self._launch_from_item(item)
+            except Exception:
+                logger.exception("Failed to launch queued job %s, dropping (recoverable on restart)", item.job_id)
+
+    async def _launch_from_item(self, item: TaskItem) -> None:
+        """Launch a TaskItem as a palimpsest job."""
+        await self._launch(
+            job_id=item.job_id,
+            task=item.task,
+            role=item.role,
+            repo=item.repo,
+            branch=item.branch,
+            evo_sha=item.evo_sha,
+        )
+
     async def _poll_and_handle(self) -> None:
         events, next_cursor = await self.client.poll(
             cursor=self.event_cursor,

@@ -88,3 +88,69 @@ async def test_handle_task_submit_deduplicates():
     )
     await sup._handle_task_submit(event)
     assert sup._task_queue.qsize() == 0   # deduped, not enqueued
+
+
+@pytest.mark.asyncio
+async def test_drain_queue_launches_when_capacity():
+    from unittest.mock import AsyncMock
+    from trenni.supervisor import Supervisor, TaskItem
+    from trenni.config import TrenniConfig
+
+    sup = Supervisor(TrenniConfig(max_workers=2))
+    item = TaskItem("evt-1", "job-1", "task", "default", "/repo", "main", None)
+    await sup._task_queue.put(item)
+
+    launched = []
+
+    async def fake_launch_from_item(i):
+        launched.append(i.job_id)
+
+    sup._launch_from_item = fake_launch_from_item
+
+    # Run _drain_queue briefly then cancel
+    task = asyncio.create_task(sup._drain_queue())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert launched == ["job-1"]
+
+
+@pytest.mark.asyncio
+async def test_drain_queue_waits_when_at_capacity():
+    from unittest.mock import AsyncMock
+    from trenni.supervisor import Supervisor, TaskItem
+    from trenni.config import TrenniConfig
+    from trenni.isolation import JobProcess
+
+    sup = Supervisor(TrenniConfig(max_workers=1))
+
+    # Fake a running job to fill capacity
+    fake_proc = AsyncMock()
+    fake_proc.returncode = None
+    from pathlib import Path
+    sup.jobs["existing-job"] = JobProcess(
+        job_id="existing-job", proc=fake_proc,
+        work_dir=Path("/tmp"), config_path=Path("/tmp/cfg.yaml")
+    )
+
+    item = TaskItem("evt-2", "job-2", "task", "default", "/repo", "main", None)
+    await sup._task_queue.put(item)
+
+    launched = []
+    async def fake_launch_from_item(i):
+        launched.append(i.job_id)
+    sup._launch_from_item = fake_launch_from_item
+
+    task = asyncio.create_task(sup._drain_queue())
+    await asyncio.sleep(0.15)  # give drain loop time to run
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert launched == []   # still waiting for capacity
