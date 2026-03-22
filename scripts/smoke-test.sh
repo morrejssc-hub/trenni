@@ -37,6 +37,10 @@ API_KEY=""
 API_KEY_ENV="ANTHROPIC_API_KEY"
 MODEL="claude-sonnet-4-6"
 
+# 工作区配置
+WORK_REPO=""
+WORK_BRANCH="main"
+
 # 超时
 JOB_TIMEOUT=120   # 等待 job 完成的最大秒数
 
@@ -48,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --api-key-env) API_KEY_ENV="$2"; shift 2;;
         --model)       MODEL="$2";       shift 2;;
         --evo-repo)    EVO_REPO="$2";    shift 2;;
+        --repo)        WORK_REPO="$2";   shift 2;;
+        --branch)      WORK_BRANCH="$2"; shift 2;;
         --task)        TASK="$2";        shift 2;;
         --timeout)     JOB_TIMEOUT="$2"; shift 2;;
         --port)        PASLOE_PORT="$2"; shift 2;;
@@ -60,6 +66,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --api-key-env NAME   Env var name for API key (default: ANTHROPIC_API_KEY)"
             echo "  --model MODEL        LLM model name (default: claude-sonnet-4-6)"
             echo "  --evo-repo PATH      Path to palimpsest-evo repo"
+            echo "  --repo URL           Git repo URL to work on (optional)"
+            echo "  --branch BRANCH      Git branch (default: main)"
             echo "  --task TEXT          Task to submit"
             echo "  --timeout SECS       Max seconds to wait for job (default: 120)"
             echo "  --port PORT          Pasloe port (default: 18900)"
@@ -156,6 +164,8 @@ evo_repo_path: "${EVO_REPO}"
 work_dir: "${WORK_DIR}/jobs"
 max_workers: 2
 poll_interval: 2.0
+default_workspace:
+  git_token_env: "GIT_TOKEN"
 ${LLM_BLOCK}
 YAML
 
@@ -177,16 +187,19 @@ ok "Trenni 已启动 (PID=$TRENNI_PID)"
 
 # ── 提交测试任务 ──────────────────────────────────────────────────────
 info "提交测试任务..."
+TASK_DATA=$(python3 -c "import json; print(json.dumps({
+    'source_id': 'smoke-test',
+    'type': 'task.submit',
+    'data': {
+        'task': '''$TASK''',
+        'role': 'default',
+        'repo': '''$WORK_REPO''',
+        'branch': '''$WORK_BRANCH'''
+    }
+}))")
 SUBMIT_RESP=$(curl -sf -X POST "${PASLOE_URL}/events" \
     -H "Content-Type: application/json" \
-    -d "$(python3 -c "import json; print(json.dumps({
-        'source_id': 'smoke-test',
-        'type': 'task.submit',
-        'data': {
-            'task': '''$TASK''',
-            'role': 'default'
-        }
-    }))")")
+    -d "$TASK_DATA")
 
 EVENT_ID=$(echo "$SUBMIT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 ok "任务已提交 (event_id=$EVENT_ID)"
