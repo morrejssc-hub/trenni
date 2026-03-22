@@ -23,6 +23,7 @@ class JobProcess:
     proc: asyncio.subprocess.Process
     work_dir: Path
     config_path: Path
+    exited_at: float | None = None
 
 
 # ---------------------------------------------------------------------------
