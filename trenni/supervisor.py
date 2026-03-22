@@ -130,6 +130,7 @@ class Supervisor:
             repo=item.repo,
             branch=item.branch,
             evo_sha=item.evo_sha,
+            source_event_id=item.source_event_id,
         )
 
     async def _poll_and_handle(self) -> None:
@@ -322,8 +323,9 @@ class Supervisor:
     async def _launch(
         self, job_id: str, task: str, role: str,
         repo: str, branch: str, evo_sha: str | None,
+        source_event_id: str = "",
     ) -> None:
-        logger.info("Launching job %s (role=%s)", job_id, role)
+        logger.info("Launching job %s (role=%s, source=%s)", job_id, role, source_event_id or "?")
 
         jp = await launch_job(
             backend=self.backend,
@@ -348,6 +350,7 @@ class Supervisor:
 
         await self.client.emit("supervisor.job.launched", {
             "job_id": job_id,
+            "source_event_id": source_event_id,
             "task": task,
             "role": role,
             "evo_sha": evo_sha or "",

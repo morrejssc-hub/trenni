@@ -154,3 +154,42 @@ async def test_drain_queue_waits_when_at_capacity():
         pass
 
     assert launched == []   # still waiting for capacity
+
+
+@pytest.mark.asyncio
+async def test_launch_emits_source_event_id():
+    from unittest.mock import AsyncMock, patch, MagicMock
+    from trenni.supervisor import Supervisor, TaskItem
+    from trenni.config import TrenniConfig
+    from pathlib import Path
+
+    sup = Supervisor(TrenniConfig())
+
+    emitted = []
+    async def fake_emit(type_, data):
+        emitted.append((type_, data))
+        return "evt-out"
+    sup.client.emit = fake_emit
+
+    # Mock the isolation backend to avoid real subprocess
+    fake_proc = AsyncMock()
+    fake_proc.returncode = None
+    fake_proc.pid = 9999
+    fake_jp_mock = MagicMock()
+    fake_jp_mock.proc = fake_proc
+    with patch("trenni.supervisor.launch_job", new_callable=AsyncMock, return_value=fake_jp_mock):
+        await sup._launch(
+            job_id="job-xyz",
+            task="test",
+            role="default",
+            repo="/repo",
+            branch="main",
+            evo_sha=None,
+            source_event_id="evt-src-123",
+        )
+
+    assert emitted, "No events emitted"
+    type_, data = emitted[0]
+    assert type_ == "supervisor.job.launched"
+    assert data["source_event_id"] == "evt-src-123"
+    assert data["job_id"] == "job-xyz"
