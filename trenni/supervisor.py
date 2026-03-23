@@ -9,7 +9,6 @@ structures.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
@@ -68,7 +67,8 @@ class Supervisor:
         # Unified spawn state
         self._ready_queue: asyncio.Queue[SpawnedJob] = asyncio.Queue()
         self._pending: dict[str, SpawnedJob] = {}       # job_id → waiting for deps
-        self._completed_jobs: set[str] = set()          # terminal job_ids
+        self._completed_jobs: set[str] = set()          # terminal job_ids (includes failed)
+        self._failed_jobs: set[str] = set()             # subset of terminal: only failed
         self._job_summaries: dict[str, str] = {}        # job_id → summary text
 
         # Dedup guard for source events (task.submit / spawn request)
@@ -207,7 +207,8 @@ class Supervisor:
             # Block here while paused; resumes instantly when resume_event is set
             await self._resume_event.wait()
             job = await self._ready_queue.get()
-            while not self._has_capacity():
+            # Wait for capacity AND not paused
+            while not self._has_capacity() or not self._resume_event.is_set():
                 await asyncio.sleep(1.0)
             try:
                 await self._launch_from_spawned(job)
@@ -293,7 +294,7 @@ class Supervisor:
         )
 
     # ------------------------------------------------------------------
-    # job.spawn.request → children (immediate) + continuation (pending)
+    # job.spawn.request → fan-out children (no continuation for now)
     # ------------------------------------------------------------------
 
     async def _handle_spawn(self, event: Event) -> None:
@@ -327,22 +328,9 @@ class Supervisor:
             )
             await self._enqueue(child)
 
-        # Continuation job — depends on all children
-        continuation = SpawnedJob(
-            job_id=f"{parent_job_id}-join",
-            source_event_id=event.id,
-            task="",                          # filled by _build_continuation on resolve
-            role="default",
-            repo=data.get("repo", ""),
-            init_branch=data.get("branch", "main"),
-            evo_sha=evo_sha,
-            depends_on=frozenset(child_ids),
-        )
-        await self._enqueue(continuation)
-
         logger.info(
-            "Spawn: parent=%s children=%s continuation=%s",
-            parent_job_id, child_ids, continuation.job_id,
+            "Spawn: parent=%s children=%s (fan-out only, no continuation)",
+            parent_job_id, child_ids,
         )
 
     # ------------------------------------------------------------------
@@ -363,37 +351,49 @@ class Supervisor:
 
     async def _handle_job_done(self, event: Event) -> None:
         job_id = event.data.get("job_id", "")
-        status = "completed" if event.type == "job.completed" else "failed"
-        logger.info("Job %s %s", job_id, status)
+        is_failure = event.type == "job.failed"
+        logger.info("Job %s %s", job_id, "failed" if is_failure else "completed")
 
         self.jobs.pop(job_id, None)
         self._completed_jobs.add(job_id)
+        if is_failure:
+            self._failed_jobs.add(job_id)
         self._job_summaries[job_id] = event.data.get("summary", "")
 
         # Scan pending jobs whose dependencies may now be satisfied
         newly_ready: list[str] = []
+        propagate_failed: list[str] = []
+
         for pending_id, pending_job in list(self._pending.items()):
+            # If any dependency failed, propagate failure
+            failed_deps = pending_job.depends_on & self._failed_jobs
+            if failed_deps:
+                propagate_failed.append(pending_id)
+                continue
+
             unsatisfied = pending_job.depends_on - self._completed_jobs
             if not unsatisfied:
-                if not pending_job.task:
-                    pending_job = self._build_continuation(pending_job)
                 newly_ready.append(pending_id)
                 await self._ready_queue.put(pending_job)
 
         for jid in newly_ready:
             del self._pending[jid]
 
-    def _build_continuation(self, job: SpawnedJob) -> SpawnedJob:
-        """Populate the continuation task text from child summaries."""
-        lines: list[str] = []
-        for child_id in sorted(job.depends_on):
-            summary = self._job_summaries.get(child_id, "(no summary)")
-            lines.append(f"- {child_id}: {summary}")
-
-        return dataclasses.replace(
-            job,
-            task="Continue after child tasks completed.\n\nChild results:\n" + "\n".join(lines),
-        )
+        # Propagate failure: emit failure event for pending jobs with failed deps
+        for jid in propagate_failed:
+            pending_job = self._pending.pop(jid)
+            failed_deps = pending_job.depends_on & self._failed_jobs
+            logger.warning(
+                "Propagating failure to job %s (failed deps: %s)",
+                jid, sorted(failed_deps),
+            )
+            self._completed_jobs.add(jid)
+            self._failed_jobs.add(jid)
+            await self.client.emit("job.failed", {
+                "job_id": jid,
+                "error": f"Dependency failed: {', '.join(sorted(failed_deps))}",
+                "code": "dependency_failed",
+            })
 
     # ------------------------------------------------------------------
     # Checkpoint + reap
@@ -509,6 +509,7 @@ class Supervisor:
             jid = e.data.get("job_id", "")
             if jid:
                 self._completed_jobs.add(jid)
+                self._failed_jobs.add(jid)
 
         # Initialise cursor to latest event
         all_events = launched_events + started_events + completed_events + failed_events + submit_events

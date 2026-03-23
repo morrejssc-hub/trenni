@@ -108,11 +108,11 @@ async def test_handle_task_submit_ignores_empty_task():
 
 
 # ---------------------------------------------------------------------------
-# job.spawn.request → children + continuation
+# job.spawn.request → fan-out children (no continuation)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_handle_spawn_creates_children_and_continuation():
+async def test_handle_spawn_creates_children_no_continuation():
     sup = _make_supervisor()
     event = _evt("spawn-1", "job.spawn.request", {
         "job_id": "parent-1",
@@ -134,11 +134,8 @@ async def test_handle_spawn_creates_children_and_continuation():
     assert c0.role == "worker"
     assert c0.depends_on == frozenset()
 
-    # continuation should be in pending
-    assert "parent-1-join" in sup._pending
-    cont = sup._pending["parent-1-join"]
-    assert cont.depends_on == frozenset({"parent-1-c0", "parent-1-c1"})
-    assert cont.task == ""  # filled on resolve
+    # No continuation should be created
+    assert len(sup._pending) == 0
 
 
 @pytest.mark.asyncio
@@ -195,12 +192,12 @@ async def test_enqueue_with_satisfied_deps_goes_to_ready():
 async def test_handle_job_done_resolves_pending():
     sup = _make_supervisor()
 
-    # Set up: continuation waiting on two children
-    cont = SpawnedJob("p-join", "e1", "", "default", "/r", "main", None,
-                      depends_on=frozenset({"p-c0", "p-c1"}))
-    sup._pending["p-join"] = cont
+    # Set up: a job waiting on two dependencies
+    dep_job = SpawnedJob("p-join", "e1", "join task", "default", "/r", "main", None,
+                         depends_on=frozenset({"p-c0", "p-c1"}))
+    sup._pending["p-join"] = dep_job
 
-    # Complete first child
+    # Complete first dependency
     await sup._handle_job_done(_evt("d1", "job.completed", {
         "job_id": "p-c0", "summary": "done A",
     }))
@@ -208,18 +205,51 @@ async def test_handle_job_done_resolves_pending():
     assert sup._ready_queue.qsize() == 0   # still waiting
     assert "p-join" in sup._pending
 
-    # Complete second child
+    # Complete second dependency
     await sup._handle_job_done(_evt("d2", "job.completed", {
         "job_id": "p-c1", "summary": "done B",
     }))
-    assert sup._ready_queue.qsize() == 1   # continuation released
+    assert sup._ready_queue.qsize() == 1   # released
     assert "p-join" not in sup._pending
 
     resolved = sup._ready_queue.get_nowait()
     assert resolved.job_id == "p-join"
-    assert "p-c0" in resolved.task
-    assert "done A" in resolved.task
-    assert "done B" in resolved.task
+
+
+@pytest.mark.asyncio
+async def test_handle_job_failed_propagates_to_dependents():
+    sup = _make_supervisor()
+
+    # Mock client.emit for failure propagation
+    emitted = []
+    async def fake_emit(type_, data):
+        emitted.append((type_, data))
+    sup.client.emit = fake_emit
+
+    # Set up: a job waiting on two dependencies
+    dep_job = SpawnedJob("p-join", "e1", "join task", "default", "/r", "main", None,
+                         depends_on=frozenset({"p-c0", "p-c1"}))
+    sup._pending["p-join"] = dep_job
+
+    # First child fails
+    await sup._handle_job_done(_evt("d1", "job.failed", {
+        "job_id": "p-c0", "error": "crash",
+    }))
+
+    # Failed job should be tracked
+    assert "p-c0" in sup._completed_jobs
+    assert "p-c0" in sup._failed_jobs
+
+    # Dependent job should be propagated as failed, not enqueued
+    assert sup._ready_queue.qsize() == 0
+    assert "p-join" not in sup._pending
+    assert "p-join" in sup._failed_jobs
+
+    # Should have emitted a job.failed event for the dependent
+    fail_events = [(t, d) for t, d in emitted if t == "job.failed"]
+    assert len(fail_events) == 1
+    assert fail_events[0][1]["job_id"] == "p-join"
+    assert fail_events[0][1]["code"] == "dependency_failed"
 
 
 @pytest.mark.asyncio
@@ -240,24 +270,6 @@ async def test_handle_job_done_removes_from_jobs():
 
     await sup._handle_job_done(_evt("d1", "job.completed", {"job_id": "j1"}))
     assert "j1" not in sup.jobs
-
-
-# ---------------------------------------------------------------------------
-# _build_continuation
-# ---------------------------------------------------------------------------
-
-def test_build_continuation_populates_task():
-    sup = _make_supervisor()
-    sup._job_summaries["c0"] = "result A"
-    sup._job_summaries["c1"] = "result B"
-
-    cont = SpawnedJob("p-join", "e1", "", "default", "/r", "main", None,
-                      depends_on=frozenset({"c0", "c1"}))
-    built = sup._build_continuation(cont)
-    assert "result A" in built.task
-    assert "result B" in built.task
-    assert built.job_id == "p-join"
-    assert built.depends_on == cont.depends_on
 
 
 # ---------------------------------------------------------------------------

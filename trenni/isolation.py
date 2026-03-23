@@ -1,10 +1,16 @@
 """Process isolation for Palimpsest job subprocesses.
 
+Three-layer architecture:
+  Layer 1 (Supervisor) — decides which jobs to launch
+  Layer 2 (This module) — prepares workspace & environment, launches in backend
+  Layer 3 (Palimpsest) — agent logic, assumes local git credentials are ready
+
 Pluggable backends: subprocess (default) and bubblewrap (bwrap).
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +30,14 @@ class JobProcess:
     work_dir: Path
     config_path: Path
     exited_at: float | None = None
+
+
+@dataclass
+class JobWorkspace:
+    """Prepared workspace for a job subprocess."""
+    job_dir: Path
+    config_path: Path
+    env: dict[str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -165,25 +179,105 @@ def create_backend(name: str, **kwargs) -> IsolationBackend:
 
 
 # ---------------------------------------------------------------------------
-# Job launcher (uses a backend)
+# Layer 2: Workspace preparation (environment setup)
 # ---------------------------------------------------------------------------
+
+def _build_git_credential_env(git_token_env: str) -> dict[str, str]:
+    """Build GIT_CONFIG_* env vars for authenticated HTTPS operations.
+
+    This sets up git credentials at the environment level so that
+    Palimpsest (Layer 3) can use plain git clone/push without
+    handling authentication itself.
+    """
+    token = os.environ.get(git_token_env, "") if git_token_env else ""
+    if not token:
+        return {}
+
+    auth_str = f"x-access-token:{token}"
+    b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+    return {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": "http.extraHeader",
+        "GIT_CONFIG_VALUE_1": f"AUTHORIZATION: basic {b64_auth}",
+    }
+
 
 def _build_job_env(
     eventstore_api_key_env: str,
-    extra_env_keys: list[str] | None = None,
+    env_keys: list[str],
 ) -> dict[str, str]:
-    """Build minimal environment for a job subprocess."""
+    """Build minimal environment for a job subprocess.
+
+    Only forwards explicitly requested environment variables.
+    """
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": os.environ.get("HOME", "/tmp"),
         eventstore_api_key_env: os.environ.get(eventstore_api_key_env, ""),
     }
-    for key in ("ANTHROPIC_API_KEY", "GIT_TOKEN", *(extra_env_keys or [])):
+    for key in env_keys:
         val = os.environ.get(key)
         if val:
             env[key] = val
     return env
 
+
+def prepare_workspace(
+    *,
+    job_id: str,
+    work_dir: Path,
+    evo_repo_path: str,
+    config: dict,
+    eventstore_api_key_env: str,
+    env_keys: list[str],
+    git_token_env: str = "",
+) -> JobWorkspace:
+    """Prepare job working directory, config file, and environment.
+
+    This is the Layer 2 responsibility: set up everything the Palimpsest
+    process needs to run, including git credentials and evo symlink.
+    """
+    job_dir = work_dir / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Palimpsest looks for evo/ relative to cwd — symlink it in.
+    evo_link = job_dir / "evo"
+    if not evo_link.exists():
+        evo_link.symlink_to(Path(evo_repo_path).resolve())
+
+    # Write Palimpsest job config
+    config_path = job_dir / "config.yaml"
+    config_path.write_text(yaml.dump(config, default_flow_style=False))
+
+    # Build environment: base + forwarded keys + git credentials
+    env = _build_job_env(eventstore_api_key_env, env_keys)
+    git_env = _build_git_credential_env(git_token_env)
+    env.update(git_env)
+
+    return JobWorkspace(job_dir=job_dir, config_path=config_path, env=env)
+
+
+async def launch_in_backend(
+    backend: IsolationBackend,
+    workspace: JobWorkspace,
+    command: list[str],
+    job_id: str,
+) -> JobProcess:
+    """Launch a prepared job in the isolation backend."""
+    proc = await backend.launch(command, cwd=workspace.job_dir, env=workspace.env)
+    return JobProcess(
+        job_id=job_id,
+        proc=proc,
+        work_dir=workspace.job_dir,
+        config_path=workspace.config_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Top-level launch interface (called by Supervisor / Layer 1)
+# ---------------------------------------------------------------------------
 
 async def launch_job(
     *,
@@ -204,14 +298,9 @@ async def launch_job(
     workspace_defaults: dict,
     publication_defaults: dict,
 ) -> JobProcess:
-    job_dir = work_dir / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    """Supervisor-facing interface: prepare workspace + launch in backend."""
 
-    # Palimpsest looks for evo/ relative to cwd — symlink it in.
-    evo_link = job_dir / "evo"
-    if not evo_link.exists():
-        evo_link.symlink_to(Path(evo_repo_path).resolve())
-
+    # Build Palimpsest job config
     config = {
         "job_id": job_id,
         "task": task,
@@ -230,26 +319,23 @@ async def launch_job(
         },
     }
 
-    config_path = job_dir / "config.yaml"
-    config_path.write_text(yaml.dump(config, default_flow_style=False))
-
-    # Forward the LLM and git credential env vars to the subprocess
-    extra_env = []
+    # Collect env var keys to forward
+    env_keys: list[str] = []
     llm_key_env = llm_defaults.get("api_key_env") if llm_defaults else None
     if llm_key_env:
-        extra_env.append(llm_key_env)
-    git_token_env = workspace_defaults.get("git_token_env") if workspace_defaults else None
-    if git_token_env:
-        extra_env.append(git_token_env)
+        env_keys.append(llm_key_env)
 
-    env = _build_job_env(eventstore_api_key_env, extra_env_keys=extra_env)
-    command = [palimpsest_command, "run", str(config_path)]
+    git_token_env = workspace_defaults.get("git_token_env", "") if workspace_defaults else ""
 
-    proc = await backend.launch(command, cwd=job_dir, env=env)
-
-    return JobProcess(
+    ws = prepare_workspace(
         job_id=job_id,
-        proc=proc,
-        work_dir=job_dir,
-        config_path=config_path,
+        work_dir=work_dir,
+        evo_repo_path=evo_repo_path,
+        config=config,
+        eventstore_api_key_env=eventstore_api_key_env,
+        env_keys=env_keys,
+        git_token_env=git_token_env,
     )
+
+    command = [palimpsest_command, "run", str(ws.config_path)]
+    return await launch_in_backend(backend, ws, command, job_id)
