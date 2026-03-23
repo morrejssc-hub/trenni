@@ -233,11 +233,14 @@ async def launch_job(
     config_path = job_dir / "config.yaml"
     config_path.write_text(yaml.dump(config, default_flow_style=False))
 
-    # Forward the LLM API key env var to the subprocess
+    # Forward the LLM and git credential env vars to the subprocess
     extra_env = []
     llm_key_env = llm_defaults.get("api_key_env") if llm_defaults else None
     if llm_key_env:
         extra_env.append(llm_key_env)
+    git_token_env = workspace_defaults.get("git_token_env") if workspace_defaults else None
+    if git_token_env:
+        extra_env.append(git_token_env)
 
     env = _build_job_env(eventstore_api_key_env, extra_env_keys=extra_env)
     command = [palimpsest_command, "run", str(config_path)]
