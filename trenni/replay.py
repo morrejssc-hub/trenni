@@ -17,14 +17,17 @@ async def rebuild_state(supervisor) -> None:
         logger.info("Found checkpoint, replay from cursor=%s", replay_cursor)
 
     fetch_plan = [
-        ("task.submit", None),
+        ("trigger.*", None),
         ("job.spawn.request", None),
-        ("task.updated", None),
         ("supervisor.job.launched", supervisor.config.source_id),
         ("job.started", None),
         ("job.completed", None),
         ("job.failed", None),
         ("job.cancelled", None),
+        ("task.created", None),
+        ("task.completed", None),
+        ("task.failed", None),
+        ("task.cancelled", None),
     ]
 
     all_events = []
@@ -43,6 +46,20 @@ async def rebuild_state(supervisor) -> None:
             started_job_ids.add(event.data["job_id"])
         elif event.type in {"job.completed", "job.failed", "job.cancelled"} and event.data.get("job_id"):
             finished_job_ids.add(event.data["job_id"])
+        elif event.type == "task.created":
+            task_id = event.data.get("task_id", "")
+            if task_id and task_id not in supervisor.state.tasks:
+                supervisor.scheduler.record_task_submission(
+                    task_id=task_id,
+                    goal=event.data.get("goal", ""),
+                    source_event_id=event.data.get("source_trigger_id", ""),
+                    spec={},
+                )
+        elif event.type in {"task.completed", "task.failed", "task.cancelled"}:
+            task_id = event.data.get("task_id", "")
+            if task_id:
+                state = event.type.split(".")[1]
+                await supervisor.scheduler.mark_task_terminal(task_id=task_id, state=state)
 
         await supervisor._handle_event(event, replay=True)
 

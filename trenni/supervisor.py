@@ -14,8 +14,11 @@ from yoitsu_contracts.events import (
     SpawnRequestData,
     SupervisorCheckpointData,
     SupervisorJobLaunchedData,
-    TaskSubmitData,
-    TaskUpdatedData,
+    TriggerData,
+    TaskCreatedData,
+    TaskCompletedData,
+    TaskFailedData,
+    TaskCancelledData,
 )
 
 from .checkpoint import mark_exited_jobs, reap_timed_out_jobs
@@ -151,8 +154,7 @@ class Supervisor:
                 url=url,
                 secret=self.config.webhook_secret,
                 event_types=[
-                    "task.submit",
-                    "task.updated",
+                    "trigger.*",
                     "job.spawn.request",
                     "job.completed",
                     "job.failed",
@@ -253,11 +255,21 @@ class Supervisor:
             return
         self._processed_event_ids.add(event.id)
 
+        if event.type.startswith("trigger."):
+            await self._handle_trigger(event, replay=replay)
+            return
+
         match event.type:
-            case "task.submit":
-                await self._handle_task_submit(event, replay=replay)
-            case "task.updated":
-                await self._handle_task_updated(event, replay=replay)
+            case "job.spawn.request":
+                await self._handle_spawn(event, replay=replay)
+            case "job.completed" | "job.failed" | "job.cancelled":
+                await self._handle_job_done(event, replay=replay)
+            case "job.started":
+                await self._handle_job_started(event, replay=replay)
+            case "supervisor.job.launched":
+                self._register_replayed_launch(event)
+            case "task.created" | "task.completed" | "task.failed" | "task.cancelled":
+                pass  # State rebuilt naturally via replay if needed, but handled directly in Trigger/Done for realtime
             case "job.spawn.request":
                 await self._handle_spawn(event, replay=replay)
             case "job.completed" | "job.failed" | "job.cancelled":
@@ -267,39 +279,54 @@ class Supervisor:
             case "supervisor.job.launched":
                 self._register_replayed_launch(event)
 
-    async def _handle_task_submit(self, event: Event, *, replay: bool = False) -> None:
+    async def _handle_trigger(self, event: Event, *, replay: bool = False) -> None:
         if event.id in self._launched_event_ids and not replay:
             return
 
-        data = TaskSubmitData.model_validate(event.data)
-        if not data.task:
-            logger.warning("Ignoring empty task.submit %s", event.id)
+        data = TriggerData.model_validate(event.data)
+        if not data.goal:
+            logger.warning("Ignoring trigger event %s with no goal", event.id)
             return
 
-        task_id = data.task_id or event.id
+        task_id = self._generate_job_id()  # Use UUID7 for root task ID
+
         self.scheduler.record_task_submission(
             task_id=task_id,
-            task=data.task,
+            goal=data.goal,
             source_event_id=event.id,
-            role=data.role,
-            repo=data.repo,
-            init_branch=data.init_branch,
-            evo_sha=data.evo_sha,
+            spec=data.context,
         )
+
+        if not replay:
+            await self.client.emit(
+                "task.created",
+                TaskCreatedData(
+                    task_id=task_id,
+                    goal=data.goal,
+                    source_trigger_id=event.id,
+                ).model_dump(mode="json"),
+            )
+
         self._launched_event_ids.add(event.id)
+
+        # Context might define execution details, otherwise use defaults
+        role = data.context.get("role", "default")
+        repo = data.context.get("repo", "")
+        init_branch = data.context.get("init_branch", "main")
+        evo_sha = data.context.get("evo_sha")
 
         cancelled = await self._enqueue(
             SpawnedJob(
                 job_id=self._generate_job_id(),
                 source_event_id=event.id,
-                task=data.task,
-                role=data.role,
-                repo=data.repo,
-                init_branch=data.init_branch,
-                evo_sha=data.evo_sha,
-                llm_overrides=dict(data.llm),
-                workspace_overrides=dict(data.workspace),
-                publication_overrides=dict(data.publication),
+                task=data.goal,
+                role=role,
+                repo=repo,
+                init_branch=init_branch,
+                evo_sha=evo_sha,
+                llm_overrides=dict(data.context.get("llm", {})),
+                workspace_overrides=dict(data.context.get("workspace", {})),
+                publication_overrides=dict(data.context.get("publication", {})),
                 task_id=task_id,
             ),
             replay=replay,
@@ -307,35 +334,25 @@ class Supervisor:
         if cancelled and not replay:
             await self._emit_cancellations(cancelled, reason="Initial condition is impossible")
 
-    async def _handle_task_updated(self, event: Event, *, replay: bool = False) -> None:
-        payload = TaskUpdatedData.model_validate(event.data)
-        _, cancelled = await self.scheduler.update_task_state(
-            task_id=payload.task_id,
-            status=payload.status,
-            summary=payload.summary,
-        )
-        if cancelled and not replay:
-            await self._emit_cancellations(cancelled, reason="Dependent task state made condition impossible")
-
     async def _handle_spawn(self, event: Event, *, replay: bool = False) -> None:
         payload = SpawnRequestData.model_validate(event.data)
         if not payload.tasks:
             return
 
         plan = self.spawn_handler.expand(event)
-        parent_task_id = payload.task_id or self.state.jobs_by_id.get(payload.job_id, SpawnedJob("", "", "", "", "", "", None)).task_id
-
-        if parent_task_id:
-            _, cancelled = await self.scheduler.update_task_state(
-                task_id=parent_task_id,
-                status="in_progress",
-                summary=f"Spawned {len(plan.child_tasks)} child task(s)",
-            )
-            if cancelled and not replay:
-                await self._emit_cancellations(cancelled, reason="Parent task update made condition impossible")
-
         for task in plan.child_tasks:
             self.state.tasks[task.task_id] = task
+            if not replay:
+                parent_id = task.task_id.rsplit('/', 1)[0]
+                await self.client.emit(
+                    "task.created",
+                    TaskCreatedData(
+                        task_id=task.task_id,
+                        parent_task_id=parent_id,
+                        goal=task.goal,
+                        source_trigger_id=task.source_event_id,
+                    ).model_dump(mode="json"),
+                )
 
         cancelled: list[SpawnedJob] = []
         for job in plan.jobs:
@@ -367,6 +384,8 @@ class Supervisor:
         )
 
         handle = self.jobs.pop(job_id, None)
+        task_id = self.state.jobs_by_id.get(job_id, SpawnedJob("", "", "", "", "", "", None)).task_id
+        
         _, cancelled = await self.scheduler.record_job_terminal(
             job_id=job_id,
             summary=summary,
@@ -376,9 +395,74 @@ class Supervisor:
 
         if handle is not None and not replay:
             await self._cleanup_handle(handle, failed=is_failure or is_cancelled)
+            await self._evaluate_task_termination(job_id=job_id, task_id=task_id, event=event)
 
         if cancelled and not replay:
             await self._emit_cancellations(cancelled, reason="Condition became impossible")
+
+    async def _evaluate_task_termination(self, job_id: str, task_id: str, event: Event) -> None:
+        if not task_id:
+            return
+        
+        task = self.state.tasks.get(task_id)
+        if task is None or task.terminal:
+            return
+
+        if not self._has_remaining_jobs(task_id):
+            if event.type == "job.failed":
+                state = "failed"
+                await self.scheduler.mark_task_terminal(task_id=task_id, state="failed")
+                await self.client.emit(
+                    "task.failed",
+                    TaskFailedData(task_id=task_id, reason=event.data.get("error", "Job failed")).model_dump(mode="json")
+                )
+                await self._cascade_cancel(task_id, reason=f"Parent or sibling failed: {event.data.get('error', '')}")
+            elif event.type == "job.cancelled":
+                state = "cancelled"
+                await self.scheduler.mark_task_terminal(task_id=task_id, state="cancelled")
+                await self.client.emit(
+                    "task.cancelled",
+                    TaskCancelledData(task_id=task_id, reason=event.data.get("reason", "Job cancelled")).model_dump(mode="json")
+                )
+                await self._cascade_cancel(task_id, reason=f"Parent or sibling cancelled: {event.data.get('reason', '')}")
+            else:
+                state = "completed"
+                await self.scheduler.mark_task_terminal(task_id=task_id, state="completed")
+                await self.client.emit(
+                    "task.completed",
+                    TaskCompletedData(task_id=task_id, summary=event.data.get("summary", "")).model_dump(mode="json")
+                )
+
+    def _has_remaining_jobs(self, task_id: str) -> bool:
+        for job_id, job in self.state.jobs_by_id.items():
+            if job.task_id == task_id and job_id not in self.state.completed_jobs:
+                return True
+        for job_id, job in self.state.pending_jobs.items():
+            if job.task_id == task_id:
+                return True
+        for job in list(self.state.ready_queue._queue):
+            if job.task_id == task_id:
+                return True
+        return False
+
+    async def _cascade_cancel(self, task_id: str, reason: str) -> None:
+        prefix = task_id + "/"
+        jobs_to_cancel: list[SpawnedJob] = []
+
+        for tid, record in list(self.state.tasks.items()):
+            if tid.startswith(prefix) and not record.terminal:
+                await self.scheduler.mark_task_terminal(task_id=tid, state="cancelled")
+                await self.client.emit(
+                    "task.cancelled",
+                    TaskCancelledData(task_id=tid, reason=reason).model_dump(mode="json")
+                )
+        
+        for job_id, job in list(self.state.jobs_by_id.items()):
+            if job.task_id and job.task_id.startswith(prefix) and job_id not in self.state.completed_jobs:
+                jobs_to_cancel.append(job)
+
+        if jobs_to_cancel:
+            await self._emit_cancellations(jobs_to_cancel, reason=reason)
 
     async def _mark_exited_jobs(self) -> None:
         await mark_exited_jobs(self.jobs, self.backend)
@@ -431,15 +515,7 @@ class Supervisor:
         await rebuild_state(self)
 
     async def _handle_job_started(self, event: Event, *, replay: bool = False) -> None:
-        task_id = event.data.get("task_id", "")
-        if task_id:
-            _, cancelled = await self.scheduler.update_task_state(
-                task_id=task_id,
-                status="in_progress",
-                summary=self.scheduler.task_summary(task_id),
-            )
-            if cancelled and not replay:
-                await self._emit_cancellations(cancelled, reason="Condition became impossible")
+        pass  # We no longer redundantly update task states to in_progress based on job.started
 
     async def _launch(
         self,
@@ -526,11 +602,6 @@ class Supervisor:
             condition=condition_to_data(condition),
         )
         await self.client.emit("supervisor.job.launched", launch.model_dump(mode="json"))
-        await self.scheduler.update_task_state(
-            task_id=task_id or job_id,
-            status="in_progress",
-            summary=self.scheduler.task_summary(task_id or job_id),
-        )
 
     async def _cleanup_handle(self, handle: JobHandle, *, failed: bool) -> None:
         if failed and self.runtime_defaults.retain_on_failure:
@@ -553,16 +624,18 @@ class Supervisor:
     async def _emit_cancellations(self, jobs: list[SpawnedJob], *, reason: str) -> None:
         for job in jobs:
             task_id = job.task_id or job.job_id
-            await self.scheduler.update_task_state(task_id=task_id, status="cancelled", summary=reason)
-            await self.client.emit(
-                "task.updated",
-                TaskUpdatedData(task_id=task_id, status="cancelled", summary=reason).model_dump(mode="json"),
-            )
             await self.client.emit(
                 "job.cancelled",
                 JobCancelledData(job_id=job.job_id, task_id=task_id, reason=reason).model_dump(mode="json"),
             )
             await self.scheduler.record_job_terminal(job_id=job.job_id, summary=reason, cancelled=True)
+            
+            # Since these jobs are now definitively terminated, evaluate if their tasks are also terminal
+            await self._evaluate_task_termination(
+                job_id=job.job_id, 
+                task_id=task_id, 
+                event=Event(id="", type="job.cancelled", source_id="", ts=datetime.now(timezone.utc), data={"reason": reason})
+            )
 
     def _poll_due_now(self) -> bool:
         if not self._webhook_active:
@@ -647,22 +720,7 @@ class Supervisor:
         self.state.remove_pending_job(job_id)
         self.state.drop_from_ready_queue(job_id)
 
-    def _spawned_job_from_event(self, event: Event) -> SpawnedJob:
-        data = TaskSubmitData.model_validate(event.data)
-        task_id = data.task_id or event.id
-        return SpawnedJob(
-            source_event_id=event.id,
-            job_id=self._generate_job_id(),
-            task=data.task,
-            role=data.role,
-            repo=data.repo,
-            init_branch=data.init_branch,
-            evo_sha=data.evo_sha,
-            llm_overrides=dict(data.llm),
-            workspace_overrides=dict(data.workspace),
-            publication_overrides=dict(data.publication),
-            task_id=task_id,
-        )
+
 
     def _generate_job_id(self) -> str:
         import uuid_utils

@@ -50,39 +50,32 @@ class Scheduler:
         self,
         *,
         task_id: str,
-        task: str,
+        goal: str,
         source_event_id: str,
-        role: str,
-        repo: str,
-        init_branch: str,
-        evo_sha: str | None,
+        spec: dict,
     ) -> None:
         self.state.tasks[task_id] = TaskRecord(
             task_id=task_id,
-            task=task,
-            state="submitted",
+            goal=goal,
             source_event_id=source_event_id,
-            role=role,
-            repo=repo,
-            init_branch=init_branch,
-            evo_sha=evo_sha,
+            spec=spec,
         )
 
-    async def update_task_state(
+    async def mark_task_terminal(
         self,
         *,
         task_id: str,
-        status: str,
-        summary: str = "",
+        state: str,
     ) -> tuple[list[SpawnedJob], list[SpawnedJob]]:
         record = self.state.tasks.get(task_id)
         if record is None:
-            record = TaskRecord(task_id=task_id, task="")
-            self.state.tasks[task_id] = record
+            return [], []
+        
+        if record.terminal:
+            return [], []
 
-        record.state = status
-        if summary:
-            record.summary = summary
+        record.terminal = True
+        record.terminal_state = state
 
         return await self._resolve_pending()
 
@@ -103,25 +96,9 @@ class Scheduler:
         if cancelled:
             self.state.cancelled_jobs.add(job_id)
 
-        job = self.state.jobs_by_id.get(job_id)
-        if job is not None and (failed or cancelled):
-            task_id = job.task_id or job_id
-            record = self.state.tasks.get(task_id)
-            if record is None:
-                record = TaskRecord(task_id=task_id, task=job.task)
-                self.state.tasks[task_id] = record
-            if record.state not in _TASK_TERMINAL_STATES:
-                record.state = "failed" if failed else "cancelled"
-                if summary:
-                    record.summary = summary
-
         return await self._resolve_pending()
 
-    def task_summary(self, task_id: str) -> str:
-        record = self.state.tasks.get(task_id)
-        if record is None:
-            return ""
-        return record.summary
+
 
     def status_snapshot(self, *, runtime_kind: str, running: bool, paused: bool) -> dict:
         return {

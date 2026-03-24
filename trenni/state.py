@@ -48,15 +48,11 @@ class SpawnDefaults:
 @dataclass
 class TaskRecord:
     task_id: str
-    task: str
-    state: str = "submitted"
-    summary: str = ""
+    goal: str
+    terminal: bool = False
+    terminal_state: str = ""
     source_event_id: str = ""
-    role: str = "default"
-    repo: str = ""
-    init_branch: str = "main"
-    evo_sha: str | None = None
-
+    spec: dict = field(default_factory=dict)
 
 @dataclass
 class SupervisorState:
@@ -75,7 +71,10 @@ class SupervisorState:
     spawn_defaults_by_job: dict[str, SpawnDefaults] = field(default_factory=dict)
 
     def task_states(self) -> dict[str, str]:
-        return {task_id: record.state for task_id, record in self.tasks.items()}
+        return {
+            task_id: (record.terminal_state if record.terminal else "submitted")
+            for task_id, record in self.tasks.items()
+        }
 
     def snapshot(self) -> dict:
         return {

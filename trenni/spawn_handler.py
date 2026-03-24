@@ -41,7 +41,8 @@ class SpawnHandler:
             if not prompt:
                 continue
 
-            task_id = f"{parent_job_id}:task:{index}"
+            parent_task_id = parent_job.task_id if parent_job and parent_job.task_id else parent_job_id
+            task_id = f"{parent_task_id}/{index}"
             job_id = f"{parent_job_id}-c{index}"
             spec = child.job_spec
 
@@ -78,13 +79,14 @@ class SpawnHandler:
         child_tasks = [
             TaskRecord(
                 task_id=task_id,
-                task=prompt,
-                state="submitted",
+                goal=prompt,
                 source_event_id=event.id,
-                role=role,
-                repo=repo,
-                init_branch=init_branch,
-                evo_sha=evo_sha,
+                spec={
+                    "role": role,
+                    "repo": repo,
+                    "init_branch": init_branch,
+                    "evo_sha": evo_sha,
+                }
             )
             for task_id, _, prompt, role, repo, init_branch, evo_sha, *_ in child_defs
         ]

@@ -53,12 +53,13 @@ def test_supervisor_has_ready_queue_and_dedup():
 
 
 @pytest.mark.asyncio
-async def test_handle_task_submit_enqueues():
+async def test_handle_trigger_enqueues():
     sup = _make_supervisor()
-    event = _evt("evt-abc", "task.submit",
-                 {"task": "do X", "role": "default", "repo": "/r", "init_branch": "main"})
+    sup.client.emit = AsyncMock()
+    event = _evt("evt-abc", "trigger.external",
+                 {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})
 
-    await sup._handle_task_submit(event)
+    await sup._handle_trigger(event)
 
     assert sup._ready_queue.qsize() == 1
     job = sup._ready_queue.get_nowait()
@@ -68,22 +69,24 @@ async def test_handle_task_submit_enqueues():
 
 
 @pytest.mark.asyncio
-async def test_handle_task_submit_deduplicates():
+async def test_handle_trigger_deduplicates():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     sup._launched_event_ids.add("evt-dup")
-    event = _evt("evt-dup", "task.submit",
-                 {"task": "do X", "role": "default"})
+    event = _evt("evt-dup", "trigger.external",
+                 {"goal": "do X", "context": {"role": "default"}})
 
-    await sup._handle_task_submit(event)
+    await sup._handle_trigger(event)
     assert sup._ready_queue.qsize() == 0
 
 
 @pytest.mark.asyncio
-async def test_handle_task_submit_ignores_empty_task():
+async def test_handle_trigger_ignores_empty_goal():
     sup = _make_supervisor()
-    event = _evt("evt-empty", "task.submit", {"task": "", "role": "default"})
+    sup.client.emit = AsyncMock()
+    event = _evt("evt-empty", "trigger.external", {"goal": "", "context": {"role": "default"}})
 
-    await sup._handle_task_submit(event)
+    await sup._handle_trigger(event)
     assert sup._ready_queue.qsize() == 0
     assert "evt-empty" not in sup._launched_event_ids
 
@@ -91,11 +94,13 @@ async def test_handle_task_submit_ignores_empty_task():
 @pytest.mark.asyncio
 async def test_handle_spawn_creates_children_no_continuation():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="main",
         role="default",
         evo_sha="parent-sha",
+        task_id="task-1",
     )
     event = _evt("spawn-1", "job.spawn.request", {
         "job_id": "parent-1",
@@ -134,11 +139,13 @@ async def test_handle_spawn_empty_tasks_ignored():
 @pytest.mark.asyncio
 async def test_handle_event_deduplicates_spawn_request():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="main",
         role="default",
         evo_sha="parent-sha",
+        task_id="task-1",
     )
     event = _evt("spawn-dup", "job.spawn.request", {
         "job_id": "parent-1",
@@ -157,11 +164,13 @@ async def test_handle_event_deduplicates_spawn_request():
 @pytest.mark.asyncio
 async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="parent-branch",
         role="parent-role",
         evo_sha="parent-sha",
+        task_id="task-1",
         llm_overrides={"model": "kimi-parent"},
         workspace_overrides={"depth": 2},
         publication_overrides={"branch_prefix": "parent/job"},
@@ -295,6 +304,8 @@ async def test_handle_job_done_caches_summary():
 @pytest.mark.asyncio
 async def test_handle_job_done_removes_from_jobs():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
+    sup.scheduler.record_job_terminal = AsyncMock(return_value=(None, []))
     sup.backend.stop = AsyncMock()
     sup.backend.remove = AsyncMock()
     sup.jobs["j1"] = JobHandle("j1", "ctr-1", "yoitsu-job-j1")
@@ -519,9 +530,11 @@ async def test_replay_enqueues_not_launched():
     sup = _make_supervisor()
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "task.submit":
-            return [_evt("sub-1", "task.submit",
-                         {"task": "do X", "role": "default", "repo": "/r", "branch": "main"})]
+        if type_ == "trigger.*":
+            return [_evt("sub-1", "trigger.external",
+                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "task.created":
+            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         return []
 
     sup._fetch_all = fake_fetch_all
@@ -535,12 +548,15 @@ async def test_replay_skips_completed():
     sup = _make_supervisor()
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "task.submit":
-            return [_evt("sub-1", "task.submit", {"task": "do X", "role": "default"})]
+        if type_ == "trigger.*":
+            return [_evt("sub-1", "trigger.external", {"goal": "do X", "context": {"role": "default"}})]
+        if type_ == "task.created":
+            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1", "job_id": "job-A",
                 "container_id": "ctr-A", "container_name": "yoitsu-job-job-A",
+                "task_id": "t-1", "task": "do X", "role": "default", "repo": "/r"
             })]
         if type_ == "job.started":
             return [_evt("s1", "job.started", {"job_id": "job-A"})]
@@ -562,15 +578,18 @@ async def test_replay_reenqueues_missing_container():
     sup._inspect_replay_state = AsyncMock(return_value=ContainerState(exists=False))
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "task.submit":
-            return [_evt("sub-1", "task.submit",
-                         {"task": "do X", "role": "default", "repo": "/r", "branch": "main"})]
+        if type_ == "trigger.*":
+            return [_evt("sub-1", "trigger.external",
+                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "task.created":
+            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1",
                 "job_id": "job-A",
                 "container_id": "ctr-A",
                 "container_name": "yoitsu-job-job-A",
+                "task_id": "t-1", "task": "do X", "role": "default", "repo": "/r"
             })]
         return []
 
@@ -588,15 +607,18 @@ async def test_replay_reattaches_running_container():
     ))
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "task.submit":
-            return [_evt("sub-1", "task.submit",
-                         {"task": "do X", "role": "default", "repo": "/r", "branch": "main"})]
+        if type_ == "trigger.*":
+            return [_evt("sub-1", "trigger.external",
+                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "task.created":
+            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1",
                 "job_id": "job-A",
                 "container_id": "ctr-A",
                 "container_name": "yoitsu-job-job-A",
+                "task_id": "t-1", "task": "do X", "role": "default", "repo": "/r"
             })]
         return []
 
@@ -616,7 +638,7 @@ async def test_replay_uses_checkpoint_cursor():
         if type_ == "supervisor.checkpoint":
             return [_evt("cp1", "supervisor.checkpoint",
                          {"cursor": "2026-01-01T00:00:00|saved-cursor"})]
-        if type_ == "task.submit":
+        if type_ == "trigger.*" or type_ == "task.created":
             return []
         return []
 
