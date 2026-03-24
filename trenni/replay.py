@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 from .checkpoint import ACTIVE_CONTAINER_STATES
 
@@ -86,19 +87,23 @@ async def rebuild_state(supervisor) -> None:
             continue
 
         if job_id in started_job_ids:
-            await supervisor.client.emit(
-                "job.failed",
-                {
-                    "job_id": job_id,
-                    "task_id": job.task_id,
-                    "error": "Container disappeared before a terminal event was emitted",
-                    "code": "runtime_lost",
-                },
-            )
+            event_data = {
+                "job_id": job_id,
+                "task_id": job.task_id,
+                "error": "Container disappeared before a terminal event was emitted",
+                "code": "runtime_lost",
+            }
+            await supervisor.client.emit("job.failed", event_data)
             await supervisor.scheduler.record_job_terminal(
                 job_id=job_id,
                 summary="Container disappeared before a terminal event was emitted",
                 failed=True,
+            )
+            from types import SimpleNamespace
+            await supervisor._evaluate_task_termination(
+                job_id=job_id,
+                task_id=job.task_id,
+                event=SimpleNamespace(id="", source_id="", type="job.failed", data=event_data),
             )
             continue
 
