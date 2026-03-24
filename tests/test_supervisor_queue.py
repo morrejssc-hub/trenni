@@ -275,12 +275,12 @@ async def test_handle_job_failed_propagates_to_dependents():
     assert "p-c0" in sup._failed_jobs
     assert sup._ready_queue.qsize() == 0
     assert "p-join" not in sup._pending
-    assert "p-join" in sup._failed_jobs
+    assert "p-join" in sup.state.cancelled_jobs
 
-    fail_events = [(t, d) for t, d in emitted if t == "job.failed"]
-    assert len(fail_events) == 1
-    assert fail_events[0][1]["job_id"] == "p-join"
-    assert fail_events[0][1]["code"] == "dependency_failed"
+    cancel_events = [(t, d) for t, d in emitted if t == "job.cancelled"]
+    assert len(cancel_events) == 1
+    assert cancel_events[0][1]["job_id"] == "p-join"
+    assert cancel_events[0][1]["code"] == "condition_unsatisfied"
 
 
 @pytest.mark.asyncio
@@ -376,7 +376,7 @@ async def test_launch_emits_container_identity():
         command=("palimpsest", "container-entrypoint"),
         config_payload_b64="abc",
     ))
-    sup.backend.create = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
+    sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock()
 
     await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
@@ -406,7 +406,7 @@ async def test_launch_removes_container_when_start_fails():
         command=("palimpsest", "container-entrypoint"),
         config_payload_b64="abc",
     ))
-    sup.backend.create = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
+    sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock(side_effect=RuntimeError("boom"))
     sup.backend.remove = AsyncMock()
 

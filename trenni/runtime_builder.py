@@ -2,28 +2,15 @@ from __future__ import annotations
 
 import base64
 import os
-from dataclasses import asdict
 
 import yaml
+from yoitsu_contracts.config import EventStoreConfig, JobConfig, JobContextConfig
+from yoitsu_contracts.env import build_git_auth_env
 
 from .config import TrenniConfig
 from .runtime_types import JobRuntimeSpec, RuntimeDefaults
 
-
-def build_git_credential_env(git_token_env: str) -> dict[str, str]:
-    token = os.environ.get(git_token_env, "") if git_token_env else ""
-    if not token:
-        return {}
-
-    auth_str = f"x-access-token:{token}"
-    b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
-    return {
-        "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": "http.extraHeader",
-        "GIT_CONFIG_VALUE_0": "",
-        "GIT_CONFIG_KEY_1": "http.extraHeader",
-        "GIT_CONFIG_VALUE_1": f"AUTHORIZATION: basic {b64_auth}",
-    }
+build_git_credential_env = build_git_auth_env
 
 
 def build_runtime_defaults(config: TrenniConfig) -> RuntimeDefaults:
@@ -61,6 +48,7 @@ class RuntimeSpecBuilder:
         self,
         *,
         job_id: str,
+        task_id: str | None = None,
         source_event_id: str,
         task: str,
         role: str,
@@ -70,6 +58,7 @@ class RuntimeSpecBuilder:
         llm_overrides: dict | None = None,
         workspace_overrides: dict | None = None,
         publication_overrides: dict | None = None,
+        job_context: JobContextConfig | None = None,
     ) -> JobRuntimeSpec:
         merged_workspace = {
             **self.config.default_workspace,
@@ -77,27 +66,34 @@ class RuntimeSpecBuilder:
             "repo": repo,
             "init_branch": init_branch,
         }
-        job_config = {
-            "job_id": job_id,
-            "task": task,
-            "role": role,
-            "workspace": merged_workspace,
-            "llm": {
-                **self.config.default_llm,
-                **(llm_overrides or {}),
-            },
-            "publication": {
-                **self.config.default_publication,
-                **(publication_overrides or {}),
-            },
-            "eventstore": {
-                "url": self.config.eventstore_url,
-                "api_key_env": self.config.pasloe_api_key_env,
-                "source_id": self.config.default_eventstore_source,
-            },
-        }
+        job_config = JobConfig.model_validate(
+            {
+                "job_id": job_id,
+                "task_id": task_id or job_id,
+                "task": task,
+                "role": role,
+                "workspace": merged_workspace,
+                "llm": {
+                    **self.config.default_llm,
+                    **(llm_overrides or {}),
+                },
+                "publication": {
+                    **self.config.default_publication,
+                    **(publication_overrides or {}),
+                },
+                "eventstore": EventStoreConfig(
+                    url=self.config.eventstore_url,
+                    api_key_env=self.config.pasloe_api_key_env,
+                    source_id=self.config.default_eventstore_source,
+                ).model_dump(mode="json"),
+                "context": (job_context or JobContextConfig()).model_dump(mode="json", exclude_none=True),
+            }
+        )
 
-        payload_text = yaml.safe_dump(job_config, sort_keys=False)
+        payload_text = yaml.safe_dump(
+            job_config.model_dump(mode="json", exclude_none=True),
+            sort_keys=False,
+        )
         payload_b64 = base64.b64encode(payload_text.encode("utf-8")).decode("utf-8")
 
         env: dict[str, str] = {
@@ -112,7 +108,7 @@ class RuntimeSpecBuilder:
         if eventstore_key:
             env[self.config.pasloe_api_key_env] = eventstore_key
 
-        env.update(build_git_credential_env(self.defaults.git_token_env))
+        env.update(build_git_auth_env(self.defaults.git_token_env))
 
         labels = {
             **self.defaults.labels,

@@ -11,6 +11,7 @@ dependencies = [
     "uuid-utils>=0.14.1",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
+    "yoitsu-contracts",
 ]
 
 [project.scripts]
@@ -24,6 +25,9 @@ dev = [
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+yoitsu-contracts = { path = "../yoitsu-contracts" }
 
 [build-system]
 requires = ["hatchling"]

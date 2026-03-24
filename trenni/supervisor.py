@@ -1,51 +1,37 @@
-"""Core supervisor: event polling loop + Podman-backed job launcher."""
+"""Core supervisor: event routing + scheduler + isolation backend."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from yoitsu_contracts.conditions import condition_from_data, condition_to_data
+from yoitsu_contracts.events import (
+    JobCancelledData,
+    JobCompletedData,
+    JobFailedData,
+    SpawnRequestData,
+    SupervisorCheckpointData,
+    SupervisorJobLaunchedData,
+    TaskSubmitData,
+    TaskUpdatedData,
+)
+
+from .checkpoint import mark_exited_jobs, reap_timed_out_jobs
 from .config import TrenniConfig
 from .pasloe_client import Event, PasloeClient
 from .podman_backend import PodmanBackend
+from .replay import rebuild_state
 from .runtime_builder import RuntimeSpecBuilder, build_runtime_defaults
 from .runtime_types import ContainerState, JobHandle
+from .scheduler import Scheduler
+from .spawn_handler import SpawnHandler
+from .state import SpawnDefaults, SpawnedJob, SupervisorState
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class SpawnedJob:
-    """A job recognised by the supervisor, possibly waiting on dependencies."""
-    job_id: str
-    source_event_id: str
-    task: str
-    role: str
-    repo: str
-    init_branch: str
-    evo_sha: str | None
-    llm_overrides: dict[str, Any] = field(default_factory=dict)
-    workspace_overrides: dict[str, Any] = field(default_factory=dict)
-    publication_overrides: dict[str, Any] = field(default_factory=dict)
-    depends_on: frozenset[str] = field(default_factory=frozenset)
-
-
-@dataclass
-class SpawnDefaults:
-    repo: str
-    init_branch: str
-    role: str
-    evo_sha: str | None
-    llm_overrides: dict[str, Any] = field(default_factory=dict)
-    workspace_overrides: dict[str, Any] = field(default_factory=dict)
-    publication_overrides: dict[str, Any] = field(default_factory=dict)
-
-
 _DEFAULT_CHECKPOINT_CYCLES = 30
-_ACTIVE_CONTAINER_STATES = {"created", "configured", "running", "paused"}
 _CONTROL_EVENT_TIMEOUT_S = 1.0
 
 
@@ -57,7 +43,7 @@ class Supervisor:
             api_key_env=config.pasloe_api_key_env,
             source_id=config.source_id,
         )
-        self.running: bool = False
+        self.running = False
 
         self._resume_event: asyncio.Event = asyncio.Event()
         self._resume_event.set()
@@ -66,24 +52,34 @@ class Supervisor:
         self.runtime_builder = RuntimeSpecBuilder(config, self.runtime_defaults)
         self.backend = PodmanBackend(self.runtime_defaults)
 
-        self.event_cursor: str | None = None
-        self.jobs: dict[str, JobHandle] = {}
+        self.state = SupervisorState()
+        self.jobs = self.state.running_jobs
+        self._ready_queue = self.state.ready_queue
+        self._pending = self.state.pending_jobs
+        self._completed_jobs = self.state.completed_jobs
+        self._failed_jobs = self.state.failed_jobs
+        self._job_summaries = self.state.job_summaries
+        self._processed_event_ids = self.state.processed_event_ids
+        self._launched_event_ids = self.state.launched_event_ids
+        self._spawn_defaults_by_job = self.state.spawn_defaults_by_job
 
-        self._ready_queue: asyncio.Queue[SpawnedJob] = asyncio.Queue()
-        self._pending: dict[str, SpawnedJob] = {}
-        self._completed_jobs: set[str] = set()
-        self._failed_jobs: set[str] = set()
-        self._job_summaries: dict[str, str] = {}
-        self._processed_event_ids: set[str] = set()
-        self._launched_event_ids: set[str] = set()
-        self._spawn_defaults_by_job: dict[str, SpawnDefaults] = {}
+        self.scheduler = Scheduler(self.state, max_workers=config.max_workers)
+        self.spawn_handler = SpawnHandler(self.state)
 
         self._checkpoint_cycles = _DEFAULT_CHECKPOINT_CYCLES
         self._reap_timeout = self.runtime_defaults.cleanup_timeout_seconds
 
         self._webhook_id: str | None = None
-        self._webhook_active: bool = False
+        self._webhook_active = False
         self._webhook_poll_not_before: float = 0.0
+
+    @property
+    def event_cursor(self) -> str | None:
+        return self.state.event_cursor
+
+    @event_cursor.setter
+    def event_cursor(self, value: str | None) -> None:
+        self.state.event_cursor = value
 
     @property
     def paused(self) -> bool:
@@ -92,15 +88,14 @@ class Supervisor:
     async def start(self) -> None:
         logger.info(
             "Supervisor starting (max_workers=%d, runtime=%s)",
-            self.config.max_workers, self.runtime_defaults.kind,
+            self.config.max_workers,
+            self.runtime_defaults.kind,
         )
         self.running = True
         drain_task: asyncio.Task | None = None
         try:
             await self.backend.ensure_ready()
             await self.client.register_source()
-            logger.info("Registered source '%s' with Pasloe", self.config.source_id)
-
             await self._replay_unfinished_tasks()
             await self._try_register_webhook()
 
@@ -125,11 +120,10 @@ class Supervisor:
         if self._webhook_id:
             try:
                 await self.client.delete_webhook(self._webhook_id)
-                logger.info("Deregistered webhook %s", self._webhook_id)
             except Exception as exc:
                 logger.warning("Could not deregister webhook: %s", exc)
 
-        for job_id, handle in list(self.jobs.items()):
+        for handle in list(self.jobs.values()):
             try:
                 if force:
                     await self.backend.remove(handle, force=True)
@@ -137,16 +131,14 @@ class Supervisor:
                     await self.backend.stop(handle, self.runtime_defaults.stop_grace_seconds)
                     await self.backend.remove(handle)
             except Exception as exc:
-                logger.warning("Could not stop job %s cleanly: %s", job_id, exc)
+                logger.warning("Could not stop job %s cleanly: %s", handle.job_id, exc)
         self.jobs.clear()
 
     async def pause(self) -> None:
-        logger.info("Supervisor pausing")
         self._resume_event.clear()
         await self._emit_control_event("supervisor.paused")
 
     async def resume(self) -> None:
-        logger.info("Supervisor resuming")
         self._resume_event.set()
         await self._emit_control_event("supervisor.resumed")
 
@@ -158,20 +150,20 @@ class Supervisor:
             self._webhook_id = await self.client.register_webhook(
                 url=url,
                 secret=self.config.webhook_secret,
-                event_types=["task.submit", "job.spawn.request",
-                             "job.completed", "job.failed", "job.started"],
+                event_types=[
+                    "task.submit",
+                    "task.updated",
+                    "job.spawn.request",
+                    "job.completed",
+                    "job.failed",
+                    "job.cancelled",
+                    "job.started",
+                ],
             )
             self._webhook_active = True
             self._reset_webhook_poll_deadline()
-            logger.info(
-                "Registered webhook (id=%s) → %s (poll fallback every %.0fs)",
-                self._webhook_id, url, self.config.webhook_poll_interval,
-            )
         except Exception as exc:
-            logger.warning(
-                "Could not register webhook with Pasloe (%s) — falling back to pure polling",
-                exc,
-            )
+            logger.warning("Webhook registration failed; falling back to polling: %s", exc)
 
     async def _run_loop(self) -> None:
         polls_since_checkpoint = 0
@@ -198,19 +190,35 @@ class Supervisor:
         while True:
             await self._resume_event.wait()
             job = await self._ready_queue.get()
-            while not self._has_capacity() or not self._resume_event.is_set():
+
+            evaluation = self.scheduler.evaluate_job(job)
+            if evaluation is False:
+                await self._emit_cancellations([job], reason="Condition became impossible before launch")
+                continue
+            if evaluation is None:
+                self._pending[job.job_id] = job
+                continue
+
+            while not self.scheduler.has_capacity() or not self._resume_event.is_set():
                 await asyncio.sleep(1.0)
-            try:
-                await self._launch_from_spawned(job)
-            except Exception:
-                logger.exception(
-                    "Failed to launch queued job %s, dropping (recoverable on restart)",
-                    job.job_id,
-                )
+                evaluation = self.scheduler.evaluate_job(job)
+                if evaluation is False:
+                    await self._emit_cancellations([job], reason="Condition became impossible before launch")
+                    break
+                if evaluation is None:
+                    self._pending[job.job_id] = job
+                    break
+            else:
+                try:
+                    await self._launch_from_spawned(job)
+                except Exception:
+                    logger.exception("Failed to launch queued job %s", job.job_id)
+                continue
 
     async def _launch_from_spawned(self, job: SpawnedJob) -> None:
         await self._launch(
             job_id=job.job_id,
+            task_id=job.task_id or job.job_id,
             task=job.task,
             role=job.role,
             repo=job.repo,
@@ -220,13 +228,13 @@ class Supervisor:
             workspace_overrides=job.workspace_overrides,
             publication_overrides=job.publication_overrides,
             source_event_id=job.source_event_id,
+            job_context=job.job_context,
+            parent_job_id=job.parent_job_id,
+            condition=job.condition,
         )
 
     async def _poll_and_handle(self) -> None:
-        events, next_cursor = await self.client.poll(
-            cursor=self.event_cursor,
-            limit=100,
-        )
+        events, next_cursor = await self.client.poll(cursor=self.event_cursor, limit=100)
         if next_cursor:
             self.event_cursor = next_cursor
         elif events:
@@ -234,250 +242,177 @@ class Supervisor:
             self.event_cursor = f"{last.ts.isoformat()}|{last.id}"
 
         for event in events:
-            try:
-                await self._handle_event(event)
-            except Exception:
-                logger.exception("Error handling event %s (type=%s)", event.id, event.type)
+            await self._handle_event(event)
 
-    async def _handle_event(self, event: Event, *, realtime: bool = False) -> None:
+    async def _handle_event(self, event: Event, *, realtime: bool = False, replay: bool = False) -> None:
         if realtime:
             self._advance_cursor_from_event(event)
             self._reset_webhook_poll_deadline()
 
         if event.id in self._processed_event_ids:
-            logger.debug("Skipping already-processed event %s (type=%s)", event.id, event.type)
             return
-
         self._processed_event_ids.add(event.id)
 
         match event.type:
             case "task.submit":
-                await self._handle_task_submit(event)
+                await self._handle_task_submit(event, replay=replay)
+            case "task.updated":
+                await self._handle_task_updated(event, replay=replay)
             case "job.spawn.request":
-                await self._handle_spawn(event)
-            case "job.completed" | "job.failed":
-                await self._handle_job_done(event)
+                await self._handle_spawn(event, replay=replay)
+            case "job.completed" | "job.failed" | "job.cancelled":
+                await self._handle_job_done(event, replay=replay)
             case "job.started":
-                self._handle_job_started(event)
+                await self._handle_job_started(event, replay=replay)
+            case "supervisor.job.launched":
+                self._register_replayed_launch(event)
 
-    async def _handle_task_submit(self, event: Event) -> None:
-        if event.id in self._launched_event_ids:
-            logger.debug("Skipping already-processed task.submit %s", event.id)
+    async def _handle_task_submit(self, event: Event, *, replay: bool = False) -> None:
+        if event.id in self._launched_event_ids and not replay:
             return
 
-        data = event.data
-        task = data.get("task", "")
-        if not task:
-            logger.warning("Ignoring task.submit with empty task (event=%s)", event.id)
+        data = TaskSubmitData.model_validate(event.data)
+        if not data.task:
+            logger.warning("Ignoring empty task.submit %s", event.id)
             return
 
+        task_id = data.task_id or event.id
+        self.scheduler.record_task_submission(
+            task_id=task_id,
+            task=data.task,
+            source_event_id=event.id,
+            role=data.role,
+            repo=data.repo,
+            init_branch=data.init_branch,
+            evo_sha=data.evo_sha,
+        )
         self._launched_event_ids.add(event.id)
 
-        job = SpawnedJob(
-            job_id=self._generate_job_id(),
-            source_event_id=event.id,
-            task=task,
-            role=data.get("role", "default"),
-            repo=data.get("repo", ""),
-            init_branch=data.get("init_branch", data.get("branch", "main")),
-            evo_sha=data.get("evo_sha"),
-            llm_overrides=dict(data.get("llm") or {}),
-            workspace_overrides=dict(data.get("workspace") or {}),
-            publication_overrides=dict(data.get("publication") or {}),
+        cancelled = await self._enqueue(
+            SpawnedJob(
+                job_id=self._generate_job_id(),
+                source_event_id=event.id,
+                task=data.task,
+                role=data.role,
+                repo=data.repo,
+                init_branch=data.init_branch,
+                evo_sha=data.evo_sha,
+                llm_overrides=dict(data.llm),
+                workspace_overrides=dict(data.workspace),
+                publication_overrides=dict(data.publication),
+                task_id=task_id,
+            ),
+            replay=replay,
         )
-        await self._enqueue(job)
-        logger.info(
-            "Queued task %s (job_id=%s, queue_size=%d)",
-            event.id, job.job_id, self._ready_queue.qsize(),
+        if cancelled and not replay:
+            await self._emit_cancellations(cancelled, reason="Initial condition is impossible")
+
+    async def _handle_task_updated(self, event: Event, *, replay: bool = False) -> None:
+        payload = TaskUpdatedData.model_validate(event.data)
+        _, cancelled = await self.scheduler.update_task_state(
+            task_id=payload.task_id,
+            status=payload.status,
+            summary=payload.summary,
         )
+        if cancelled and not replay:
+            await self._emit_cancellations(cancelled, reason="Dependent task state made condition impossible")
 
-    async def _handle_spawn(self, event: Event) -> None:
-        data = event.data
-        parent_job_id = data.get("job_id", "")
-        tasks = data.get("tasks", [])
-        parent_defaults = self._spawn_defaults_by_job.get(parent_job_id)
-
-        if not tasks:
-            logger.warning("Empty spawn request from job %s", parent_job_id)
+    async def _handle_spawn(self, event: Event, *, replay: bool = False) -> None:
+        payload = SpawnRequestData.model_validate(event.data)
+        if not payload.tasks:
             return
 
-        child_ids: list[str] = []
+        plan = self.spawn_handler.expand(event)
+        parent_task_id = payload.task_id or self.state.jobs_by_id.get(payload.job_id, SpawnedJob("", "", "", "", "", "", None)).task_id
 
-        for i, child_def in enumerate(tasks):
-            child_id = f"{parent_job_id}-c{i}"
-            prompt = (child_def.get("prompt") or child_def.get("task") or "").strip()
-            if not prompt:
-                logger.warning("Ignoring spawned child %s with empty prompt", child_id)
-                continue
-
-            child_ids.append(child_id)
-
-            job_spec = dict(child_def.get("job_spec") or {})
-
-            role = job_spec.get("role")
-            if not role and child_def.get("role_file"):
-                role = str(child_def["role_file"]).replace("roles/", "").replace(".py", "")
-            if not role and parent_defaults:
-                role = parent_defaults.role
-
-            repo = job_spec.get("repo") or child_def.get("repo", "")
-            if not repo and parent_defaults:
-                repo = parent_defaults.repo
-
-            init_branch = job_spec.get("init_branch") or child_def.get("init_branch") or child_def.get("branch")
-            if not init_branch and parent_defaults:
-                init_branch = parent_defaults.init_branch
-
-            evo_sha = job_spec.get("evo_sha") or child_def.get("evo_sha") or child_def.get("role_sha")
-            if not evo_sha and parent_defaults:
-                evo_sha = parent_defaults.evo_sha
-
-            llm_overrides = dict(parent_defaults.llm_overrides if parent_defaults else {})
-            llm_overrides.update(dict(job_spec.get("llm") or child_def.get("llm") or {}))
-
-            workspace_overrides = dict(parent_defaults.workspace_overrides if parent_defaults else {})
-            workspace_overrides.update(dict(job_spec.get("workspace") or child_def.get("workspace") or {}))
-
-            publication_overrides = dict(parent_defaults.publication_overrides if parent_defaults else {})
-            publication_overrides.update(dict(job_spec.get("publication") or child_def.get("publication") or {}))
-
-            child = SpawnedJob(
-                job_id=child_id,
-                source_event_id=event.id,
-                task=prompt,
-                role=role or "default",
-                repo=repo,
-                init_branch=init_branch or "main",
-                evo_sha=evo_sha,
-                llm_overrides=llm_overrides,
-                workspace_overrides=workspace_overrides,
-                publication_overrides=publication_overrides,
+        if parent_task_id:
+            _, cancelled = await self.scheduler.update_task_state(
+                task_id=parent_task_id,
+                status="in_progress",
+                summary=f"Spawned {len(plan.child_tasks)} child task(s)",
             )
-            await self._enqueue(child)
+            if cancelled and not replay:
+                await self._emit_cancellations(cancelled, reason="Parent task update made condition impossible")
 
-        logger.info(
-            "Spawn: parent=%s children=%s (fan-out only, no continuation)",
-            parent_job_id, child_ids,
+        for task in plan.child_tasks:
+            self.state.tasks[task.task_id] = task
+
+        cancelled: list[SpawnedJob] = []
+        for job in plan.jobs:
+            cancelled.extend(await self._enqueue(job, replay=replay))
+
+        if cancelled and not replay:
+            await self._emit_cancellations(cancelled, reason="Spawn condition is already impossible")
+
+    async def _enqueue(self, job: SpawnedJob, *, replay: bool = False) -> list[SpawnedJob]:
+        cancelled = await self.scheduler.enqueue(job)
+        if job.job_id in self._pending:
+            logger.debug("Pending job %s waiting on condition", job.job_id)
+        elif not cancelled:
+            logger.debug("Queued job %s", job.job_id)
+        return [] if replay else cancelled
+
+    async def _handle_job_done(self, event: Event, *, replay: bool = False) -> None:
+        job_id = event.data.get("job_id", "")
+        if not job_id:
+            return
+
+        is_failure = event.type == "job.failed"
+        is_cancelled = event.type == "job.cancelled"
+        summary = (
+            event.data.get("summary")
+            or event.data.get("error")
+            or event.data.get("reason")
+            or ""
         )
 
-    async def _enqueue(self, job: SpawnedJob) -> None:
-        unsatisfied = job.depends_on - self._completed_jobs
-        if not unsatisfied:
-            await self._ready_queue.put(job)
-        else:
-            self._pending[job.job_id] = job
-
-    async def _handle_job_done(self, event: Event) -> None:
-        job_id = event.data.get("job_id", "")
-        is_failure = event.type == "job.failed"
-        logger.info("Job %s %s", job_id, "failed" if is_failure else "completed")
-
         handle = self.jobs.pop(job_id, None)
-        self._completed_jobs.add(job_id)
-        if is_failure:
-            self._failed_jobs.add(job_id)
-        self._job_summaries[job_id] = event.data.get("summary", "")
+        _, cancelled = await self.scheduler.record_job_terminal(
+            job_id=job_id,
+            summary=summary,
+            failed=is_failure,
+            cancelled=is_cancelled,
+        )
 
-        if handle is not None:
-            await self._cleanup_handle(handle, failed=is_failure)
+        if handle is not None and not replay:
+            await self._cleanup_handle(handle, failed=is_failure or is_cancelled)
 
-        newly_ready: list[str] = []
-        propagate_failed: list[str] = []
-
-        for pending_id, pending_job in list(self._pending.items()):
-            failed_deps = pending_job.depends_on & self._failed_jobs
-            if failed_deps:
-                propagate_failed.append(pending_id)
-                continue
-
-            unsatisfied = pending_job.depends_on - self._completed_jobs
-            if not unsatisfied:
-                newly_ready.append(pending_id)
-                await self._ready_queue.put(pending_job)
-
-        for jid in newly_ready:
-            del self._pending[jid]
-
-        for jid in propagate_failed:
-            pending_job = self._pending.pop(jid)
-            failed_deps = pending_job.depends_on & self._failed_jobs
-            logger.warning(
-                "Propagating failure to job %s (failed deps: %s)",
-                jid, sorted(failed_deps),
-            )
-            self._completed_jobs.add(jid)
-            self._failed_jobs.add(jid)
-            await self.client.emit("job.failed", {
-                "job_id": jid,
-                "error": f"Dependency failed: {', '.join(sorted(failed_deps))}",
-                "code": "dependency_failed",
-            })
+        if cancelled and not replay:
+            await self._emit_cancellations(cancelled, reason="Condition became impossible")
 
     async def _mark_exited_jobs(self) -> None:
-        now = time.monotonic()
-        for handle in self.jobs.values():
-            state = await self.backend.inspect(handle)
-            if not state.exists:
-                if handle.exited_at is None:
-                    handle.exited_at = now
-                continue
-
-            if state.running or state.status in _ACTIVE_CONTAINER_STATES:
-                continue
-
-            if handle.exited_at is None:
-                handle.exited_at = now
-                handle.exit_code = state.exit_code
-                logger.info(
-                    "Container for job %s exited (status=%s, rc=%s)",
-                    handle.job_id,
-                    state.status or "unknown",
-                    "?" if state.exit_code is None else state.exit_code,
-                )
+        await mark_exited_jobs(self.jobs, self.backend)
 
     async def _checkpoint(self) -> None:
-        now = time.monotonic()
-        reaped: list[JobHandle] = []
+        reaped = await reap_timed_out_jobs(
+            self.jobs,
+            backend=self.backend,
+            reap_timeout=self._reap_timeout,
+        )
 
-        for handle in list(self.jobs.values()):
-            if handle.exited_at is None or (now - handle.exited_at) <= self._reap_timeout:
-                continue
-
-            logs = await self.backend.logs(handle)
-            logger.warning(
-                "Job %s container exited %ds ago without terminal event",
-                handle.job_id, int(now - handle.exited_at),
-            )
-            await self.client.emit("job.failed", {
-                "job_id": handle.job_id,
-                "error": (
-                    "Container exited without emitting terminal event "
-                    f"(exit_code={handle.exit_code})"
-                ),
-                "code": "runtime_lost",
-                "logs_tail": logs[-4000:],
-            })
-            reaped.append(handle)
-
-        for handle in reaped:
+        for handle, logs in reaped:
             self.jobs.pop(handle.job_id, None)
-            self._completed_jobs.add(handle.job_id)
-            self._failed_jobs.add(handle.job_id)
+            await self.scheduler.record_job_terminal(
+                job_id=handle.job_id,
+                summary=f"Container exited without terminal event (exit_code={handle.exit_code})",
+                failed=True,
+            )
+            await self.client.emit(
+                "job.failed",
+                {
+                    "job_id": handle.job_id,
+                    "task_id": self.state.jobs_by_id.get(handle.job_id, SpawnedJob("", "", "", "", "", "", None)).task_id,
+                    "error": f"Container exited without emitting terminal event (exit_code={handle.exit_code})",
+                    "code": "runtime_lost",
+                    "logs_tail": logs[-4000:],
+                },
+            )
             await self._cleanup_handle(handle, failed=True)
 
-        await self.client.emit("supervisor.checkpoint", {
-            "cursor": self.event_cursor,
-            "running_jobs": list(self.jobs.keys()),
-            "pending_jobs": list(self._pending.keys()),
-            "ready_queue_size": self._ready_queue.qsize(),
-            "completed_count": len(self._completed_jobs),
-        })
+        snapshot = SupervisorCheckpointData.model_validate(self.state.snapshot())
+        await self.client.emit("supervisor.checkpoint", snapshot.model_dump(mode="json"))
 
-    async def _fetch_all(
-        self,
-        type_: str,
-        source: str | None = None,
-    ) -> list[Event]:
+    async def _fetch_all(self, type_: str, source: str | None = None) -> list[Event]:
         results: list[Event] = []
         cursor = None
         while True:
@@ -489,145 +424,22 @@ class Supervisor:
             )
             results.extend(events)
             if not next_cursor:
-                break
+                return results
             cursor = next_cursor
-        return results
 
     async def _replay_unfinished_tasks(self) -> None:
-        logger.info("Replaying unfinished tasks from Pasloe...")
+        await rebuild_state(self)
 
-        checkpoints = await self._fetch_all(
-            "supervisor.checkpoint", source=self.config.source_id
-        )
-        replay_cursor: str | None = None
-        if checkpoints:
-            latest_cp = checkpoints[-1]
-            replay_cursor = latest_cp.data.get("cursor")
-            logger.info("Found checkpoint, replay from cursor=%s", replay_cursor)
-
-        launched_events = await self._fetch_all(
-            "supervisor.job.launched", source=self.config.source_id
-        )
-        started_events = await self._fetch_all("job.started")
-        completed_events = await self._fetch_all("job.completed")
-        failed_events = await self._fetch_all("job.failed")
-        submit_events = await self._fetch_all("task.submit")
-
-        launched_map: dict[str, Event] = {
-            e.data["source_event_id"]: e
-            for e in launched_events
-            if e.data.get("source_event_id")
-        }
-        for e in launched_events:
-            job_id = e.data.get("job_id", "")
-            if not job_id:
-                continue
-            self._spawn_defaults_by_job[job_id] = SpawnDefaults(
-                repo=e.data.get("repo", ""),
-                init_branch=e.data.get("init_branch", "main"),
-                role=e.data.get("role", "default"),
-                evo_sha=e.data.get("evo_sha") or None,
-                llm_overrides=dict(e.data.get("llm") or {}),
-                workspace_overrides=dict(e.data.get("workspace") or {}),
-                publication_overrides=dict(e.data.get("publication") or {}),
+    async def _handle_job_started(self, event: Event, *, replay: bool = False) -> None:
+        task_id = event.data.get("task_id", "")
+        if task_id:
+            _, cancelled = await self.scheduler.update_task_state(
+                task_id=task_id,
+                status="in_progress",
+                summary=self.scheduler.task_summary(task_id),
             )
-        started_job_ids = {
-            e.data["job_id"] for e in started_events if e.data.get("job_id")
-        }
-        finished_job_ids = {
-            e.data["job_id"]
-            for e in (completed_events + failed_events)
-            if e.data.get("job_id")
-        }
-
-        for e in completed_events:
-            jid = e.data.get("job_id", "")
-            if jid:
-                self._completed_jobs.add(jid)
-                self._job_summaries[jid] = e.data.get("summary", "")
-        for e in failed_events:
-            jid = e.data.get("job_id", "")
-            if jid:
-                self._completed_jobs.add(jid)
-                self._failed_jobs.add(jid)
-
-        all_events = launched_events + started_events + completed_events + failed_events + submit_events
-        if replay_cursor:
-            self.event_cursor = replay_cursor
-        else:
-            latest = max(all_events, key=lambda e: (e.ts, e.id), default=None)
-            if latest:
-                self.event_cursor = f"{latest.ts.isoformat()}|{latest.id}"
-        logger.info("Replay cursor set to %s", self.event_cursor)
-
-        enqueued = skipped = reattached = lost = 0
-        for event in submit_events:
-            data = event.data
-            task = data.get("task", "")
-            if not task:
-                continue
-
-            launched = launched_map.get(event.id)
-            if launched is None:
-                self._launched_event_ids.add(event.id)
-                await self._enqueue(self._spawned_job_from_event(event))
-                enqueued += 1
-                continue
-
-            job_id = launched.data.get("job_id", "")
-            container_id = launched.data.get("container_id", "")
-            container_name = launched.data.get("container_name", "")
-
-            if job_id in finished_job_ids:
-                self._launched_event_ids.add(event.id)
-                skipped += 1
-                continue
-
-            state = await self._inspect_replay_state(container_id, container_name)
-            handle = self._handle_from_replay(job_id, container_id, container_name)
-
-            if job_id in started_job_ids:
-                if state.exists and (state.running or state.status in _ACTIVE_CONTAINER_STATES):
-                    self.jobs[job_id] = handle
-                    self._launched_event_ids.add(event.id)
-                    reattached += 1
-                    continue
-
-                self._completed_jobs.add(job_id)
-                self._failed_jobs.add(job_id)
-                self._launched_event_ids.add(event.id)
-                await self.client.emit("job.failed", {
-                    "job_id": job_id,
-                    "error": "Container disappeared before a terminal event was emitted",
-                    "code": "runtime_lost",
-                })
-                if state.exists:
-                    await self._cleanup_handle(handle, failed=True)
-                lost += 1
-                continue
-
-            if state.exists and (state.running or state.status in _ACTIVE_CONTAINER_STATES):
-                self.jobs[job_id] = handle
-                self._launched_event_ids.add(event.id)
-                reattached += 1
-                continue
-
-            if state.exists:
-                await self._cleanup_handle(handle, failed=True)
-
-            self._launched_event_ids.add(event.id)
-            await self._enqueue(self._spawned_job_from_event(event))
-            enqueued += 1
-
-        logger.info(
-            "Replay complete: %d enqueued, %d skipped, %d reattached, %d lost",
-            enqueued, skipped, reattached, lost,
-        )
-
-    def _handle_job_started(self, event: Event) -> None:
-        job_id = event.data.get("job_id", "")
-        evo_sha = event.data.get("evo_sha", "")
-        logger.info("Job %s started (evo_sha=%s)", job_id, evo_sha or "unknown")
+            if cancelled and not replay:
+                await self._emit_cancellations(cancelled, reason="Condition became impossible")
 
     async def _launch(
         self,
@@ -641,11 +453,14 @@ class Supervisor:
         workspace_overrides: dict[str, Any] | None = None,
         publication_overrides: dict[str, Any] | None = None,
         source_event_id: str = "",
+        task_id: str = "",
+        job_context=None,
+        parent_job_id: str = "",
+        condition=None,
     ) -> None:
-        logger.info("Launching job %s (role=%s, source=%s)", job_id, role, source_event_id or "?")
-
         spec = self.runtime_builder.build(
             job_id=job_id,
+            task_id=task_id or job_id,
             source_event_id=source_event_id,
             task=task,
             role=role,
@@ -655,8 +470,9 @@ class Supervisor:
             llm_overrides=llm_overrides,
             workspace_overrides=workspace_overrides,
             publication_overrides=publication_overrides,
+            job_context=job_context,
         )
-        handle = await self.backend.create(spec)
+        handle = await self.backend.prepare(spec)
         try:
             await self.backend.start(handle)
         except Exception:
@@ -664,6 +480,22 @@ class Supervisor:
             raise
 
         self.jobs[job_id] = handle
+        self.state.jobs_by_id[job_id] = SpawnedJob(
+            job_id=job_id,
+            source_event_id=source_event_id,
+            task=task,
+            role=role,
+            repo=repo,
+            init_branch=init_branch,
+            evo_sha=evo_sha,
+            llm_overrides=dict(llm_overrides or {}),
+            workspace_overrides=dict(workspace_overrides or {}),
+            publication_overrides=dict(publication_overrides or {}),
+            task_id=task_id or job_id,
+            condition=condition,
+            job_context=job_context or self.state.jobs_by_id.get(job_id, SpawnedJob("", "", "", "", "", "", None)).job_context,
+            parent_job_id=parent_job_id,
+        )
         self._spawn_defaults_by_job[job_id] = SpawnDefaults(
             repo=repo,
             init_branch=init_branch,
@@ -672,23 +504,33 @@ class Supervisor:
             llm_overrides=dict(llm_overrides or {}),
             workspace_overrides=dict(workspace_overrides or {}),
             publication_overrides=dict(publication_overrides or {}),
+            task_id=task_id or job_id,
         )
 
-        await self.client.emit("supervisor.job.launched", {
-            "job_id": job_id,
-            "source_event_id": source_event_id,
-            "task": task,
-            "role": role,
-            "repo": repo,
-            "init_branch": init_branch,
-            "evo_sha": evo_sha or "",
-            "llm": dict(llm_overrides or {}),
-            "workspace": dict(workspace_overrides or {}),
-            "publication": dict(publication_overrides or {}),
-            "runtime_kind": self.runtime_defaults.kind,
-            "container_id": handle.container_id,
-            "container_name": handle.container_name,
-        })
+        launch = SupervisorJobLaunchedData(
+            job_id=job_id,
+            task_id=task_id or job_id,
+            source_event_id=source_event_id,
+            task=task,
+            role=role,
+            repo=repo,
+            init_branch=init_branch,
+            evo_sha=evo_sha or "",
+            llm=dict(llm_overrides or {}),
+            workspace=dict(workspace_overrides or {}),
+            publication=dict(publication_overrides or {}),
+            runtime_kind=self.runtime_defaults.kind,
+            container_id=handle.container_id,
+            container_name=handle.container_name,
+            parent_job_id=parent_job_id,
+            condition=condition_to_data(condition),
+        )
+        await self.client.emit("supervisor.job.launched", launch.model_dump(mode="json"))
+        await self.scheduler.update_task_state(
+            task_id=task_id or job_id,
+            status="in_progress",
+            summary=self.scheduler.task_summary(task_id or job_id),
+        )
 
     async def _cleanup_handle(self, handle: JobHandle, *, failed: bool) -> None:
         if failed and self.runtime_defaults.retain_on_failure:
@@ -704,23 +546,32 @@ class Supervisor:
 
     async def _emit_control_event(self, event_type: str) -> None:
         try:
-            await self.client.emit(
-                event_type,
-                {},
-                timeout=_CONTROL_EVENT_TIMEOUT_S,
-            )
+            await self.client.emit(event_type, {}, timeout=_CONTROL_EVENT_TIMEOUT_S)
         except Exception:
-            logger.warning("Could not emit %s event", event_type)
+            logger.warning("Could not emit %s", event_type)
+
+    async def _emit_cancellations(self, jobs: list[SpawnedJob], *, reason: str) -> None:
+        for job in jobs:
+            task_id = job.task_id or job.job_id
+            await self.scheduler.update_task_state(task_id=task_id, status="cancelled", summary=reason)
+            await self.client.emit(
+                "task.updated",
+                TaskUpdatedData(task_id=task_id, status="cancelled", summary=reason).model_dump(mode="json"),
+            )
+            await self.client.emit(
+                "job.cancelled",
+                JobCancelledData(job_id=job.job_id, task_id=task_id, reason=reason).model_dump(mode="json"),
+            )
+            await self.scheduler.record_job_terminal(job_id=job.job_id, summary=reason, cancelled=True)
 
     def _poll_due_now(self) -> bool:
         if not self._webhook_active:
             return True
-        return time.monotonic() >= self._webhook_poll_not_before
+        return asyncio.get_running_loop().time() >= self._webhook_poll_not_before
 
     def _reset_webhook_poll_deadline(self) -> None:
-        if not self._webhook_active:
-            return
-        self._webhook_poll_not_before = time.monotonic() + self.config.webhook_poll_interval
+        if self._webhook_active:
+            self._webhook_poll_not_before = asyncio.get_running_loop().time() + self.config.webhook_poll_interval
 
     def _advance_cursor_from_event(self, event: Event) -> None:
         current = self._cursor_key(self.event_cursor)
@@ -734,9 +585,6 @@ class Supervisor:
             return None
         try:
             ts_raw, event_id = cursor.split("|", 1)
-        except ValueError:
-            return None
-        try:
             return datetime.fromisoformat(ts_raw), event_id
         except ValueError:
             return None
@@ -751,42 +599,74 @@ class Supervisor:
 
     def _handle_from_replay(self, job_id: str, container_id: str, container_name: str) -> JobHandle:
         ref = container_id or container_name or f"yoitsu-job-{job_id}"
-        return JobHandle(
-            job_id=job_id,
-            container_id=container_id or ref,
-            container_name=container_name or ref,
-        )
+        return JobHandle(job_id=job_id, container_id=container_id or ref, container_name=container_name or ref)
 
-    def _spawned_job_from_event(self, event: Event) -> SpawnedJob:
+    def _register_replayed_launch(self, event: Event) -> None:
         data = event.data
-        return SpawnedJob(
-            source_event_id=event.id,
-            job_id=self._generate_job_id(),
+        job_id = data.get("job_id", "")
+        if not job_id:
+            return
+
+        source_event_id = data.get("source_event_id", "")
+        self.state.discard_scheduled_by_source_event(source_event_id, keep_job_id=job_id)
+
+        existing = self.state.jobs_by_id.get(job_id)
+        self.state.jobs_by_id[job_id] = existing or SpawnedJob(
+            job_id=job_id,
+            source_event_id=source_event_id,
             task=data.get("task", ""),
             role=data.get("role", "default"),
             repo=data.get("repo", ""),
-            init_branch=data.get("init_branch", data.get("branch", "main")),
-            evo_sha=data.get("evo_sha"),
+            init_branch=data.get("init_branch", "main"),
+            evo_sha=data.get("evo_sha") or None,
             llm_overrides=dict(data.get("llm") or {}),
             workspace_overrides=dict(data.get("workspace") or {}),
             publication_overrides=dict(data.get("publication") or {}),
+            task_id=data.get("task_id", "") or job_id,
+            condition=condition_from_data(data.get("condition")),
+            parent_job_id=data.get("parent_job_id", ""),
         )
+        self._spawn_defaults_by_job[job_id] = SpawnDefaults(
+            repo=data.get("repo", ""),
+            init_branch=data.get("init_branch", "main"),
+            role=data.get("role", "default"),
+            evo_sha=data.get("evo_sha") or None,
+            llm_overrides=dict(data.get("llm") or {}),
+            workspace_overrides=dict(data.get("workspace") or {}),
+            publication_overrides=dict(data.get("publication") or {}),
+            task_id=data.get("task_id", "") or job_id,
+        )
+        if source_event_id:
+            self._launched_event_ids.add(source_event_id)
+        self.state.remove_pending_job(job_id)
+        self.state.drop_from_ready_queue(job_id)
 
-    def _has_capacity(self) -> bool:
-        return len(self.jobs) < self.config.max_workers
+    def _spawned_job_from_event(self, event: Event) -> SpawnedJob:
+        data = TaskSubmitData.model_validate(event.data)
+        task_id = data.task_id or event.id
+        return SpawnedJob(
+            source_event_id=event.id,
+            job_id=self._generate_job_id(),
+            task=data.task,
+            role=data.role,
+            repo=data.repo,
+            init_branch=data.init_branch,
+            evo_sha=data.evo_sha,
+            llm_overrides=dict(data.llm),
+            workspace_overrides=dict(data.workspace),
+            publication_overrides=dict(data.publication),
+            task_id=task_id,
+        )
 
     def _generate_job_id(self) -> str:
         import uuid_utils
+
         return str(uuid_utils.uuid7())
 
     @property
     def status(self) -> dict:
-        return {
-            "running": self.running,
-            "paused": self.paused,
-            "running_jobs": len(self.jobs),
-            "max_workers": self.config.max_workers,
-            "pending_jobs": len(self._pending),
-            "ready_queue_size": self._ready_queue.qsize(),
-            "runtime_kind": self.runtime_defaults.kind,
-        }
+        return self.scheduler.status_snapshot(
+            runtime_kind=self.runtime_defaults.kind,
+            running=self.running,
+            paused=self.paused,
+        )

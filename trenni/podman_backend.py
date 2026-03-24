@@ -31,7 +31,7 @@ class PodmanBackend:
         await self._ensure_pod_exists(self.defaults.pod_name)
         await self._ensure_image_available(self.defaults.image, self.defaults.pull_policy)
 
-    async def create(self, spec: JobRuntimeSpec) -> JobHandle:
+    async def prepare(self, spec: JobRuntimeSpec) -> JobHandle:
         payload = {
             "name": spec.container_name,
             "image": spec.image,
@@ -47,6 +47,9 @@ class PodmanBackend:
             container_id=data["Id"],
             container_name=spec.container_name,
         )
+
+    async def create(self, spec: JobRuntimeSpec) -> JobHandle:
+        return await self.prepare(spec)
 
     async def start(self, handle: JobHandle) -> None:
         response = await self._request(

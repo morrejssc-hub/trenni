@@ -72,13 +72,7 @@ def build_control_app(supervisor: "Supervisor") -> FastAPI:
             raise HTTPException(status_code=422, detail="Invalid payload")
 
         from .pasloe_client import Event
-        event = Event(
-            id=payload.id,
-            source_id=payload.source_id,
-            type=payload.type,
-            ts=payload.ts,
-            data=payload.data,
-        )
+        event = Event(id=payload.id, source_id=payload.source_id, type=payload.type, ts=payload.ts, data=payload.data)
         try:
             await supervisor._handle_event(event, realtime=True)
         except Exception:

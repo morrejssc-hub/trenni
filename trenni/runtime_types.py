@@ -52,4 +52,3 @@ class ContainerState:
 @dataclass(frozen=True)
 class ContainerExit:
     status_code: int | None
-
