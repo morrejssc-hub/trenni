@@ -34,6 +34,19 @@ class Scheduler:
         task_id = job.task_id or job.job_id
         if not job.task_id:
             job = replace(job, task_id=task_id)
+
+        # Intake replays can redeliver the same logical job. Keep enqueue idempotent
+        # by short-circuiting when the job is already scheduled or terminal.
+        if job.job_id in self.state.completed_jobs or job.job_id in self.state.cancelled_jobs:
+            self.state.jobs_by_id[job.job_id] = job
+            return []
+        if job.job_id in self.state.running_jobs:
+            self.state.jobs_by_id[job.job_id] = job
+            return []
+        if job.job_id in self.state.pending_jobs or self.state.has_ready_job(job.job_id):
+            self.state.jobs_by_id[job.job_id] = job
+            return []
+
         self.state.jobs_by_id[job.job_id] = job
 
         outcome = self.evaluate_job(job)

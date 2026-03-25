@@ -18,8 +18,7 @@ async def rebuild_state(supervisor) -> None:
         logger.info("Found checkpoint, replay from cursor=%s", replay_cursor)
 
     fetch_plan = [
-        ("trigger.*", None),
-        ("job.spawn.request", None),
+        ("supervisor.job.enqueued", supervisor.config.source_id),
         ("supervisor.job.launched", supervisor.config.source_id),
         ("job.started", None),
         ("job.completed", None),

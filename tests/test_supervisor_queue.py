@@ -212,7 +212,6 @@ async def test_handle_event_realtime_advances_cursor_and_delays_poll():
 async def test_handle_event_marks_processed_only_after_success():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
-    sup._generate_job_id = MagicMock(side_effect=["task-1", "job-1"])
     event = _evt(
         "evt-retry",
         "trigger.external",
@@ -242,8 +241,59 @@ async def test_handle_event_marks_processed_only_after_success():
 
 
 @pytest.mark.asyncio
+async def test_poll_and_handle_advances_cursor_only_after_successful_intake():
+    sup = _make_supervisor()
+    t0 = datetime.fromisoformat("2026-01-01T00:00:00")
+    t1 = datetime.fromisoformat("2026-01-01T00:00:01")
+    event_ok = Event(id="evt-1", source_id="test", type="job.started", ts=t0, data={"job_id": "j1"})
+    event_fail = Event(id="evt-2", source_id="test", type="job.started", ts=t1, data={"job_id": "j2"})
+
+    async def fake_poll(cursor=None, source=None, type_=None, limit=100):
+        return [event_ok, event_fail], "ignored-next-cursor"
+
+    original_handle_event = sup._handle_event
+
+    async def flaky_handle_event(event, *, realtime=False, replay=False):
+        if event.id == "evt-2":
+            raise RuntimeError("boom")
+        return await original_handle_event(event, realtime=realtime, replay=replay)
+
+    sup.client.poll = fake_poll
+    sup._handle_event = flaky_handle_event
+
+    with pytest.raises(RuntimeError):
+        await sup._poll_and_handle()
+
+    assert sup.event_cursor == "2026-01-01T00:00:00|evt-1"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_emits_supervisor_job_enqueued():
+    sup = _make_supervisor()
+    emitted = []
+
+    async def fake_emit(event_type, data, *, timeout=None, idempotency_key=None):
+        emitted.append((event_type, data, idempotency_key))
+        return "evt-id"
+
+    sup.client.emit = fake_emit
+    job = SpawnedJob("j1", "e1", "task", "default", "/repo", "main", None, task_id="t1")
+
+    await sup._enqueue(job)
+
+    assert emitted
+    event_type, data, idem = emitted[0]
+    assert event_type == "supervisor.job.enqueued"
+    assert data["job_id"] == "j1"
+    assert data["task_id"] == "t1"
+    assert data["queue_state"] == "ready"
+    assert idem == "trenni:e1:supervisor.job.enqueued:j1"
+
+
+@pytest.mark.asyncio
 async def test_enqueue_immediate_goes_to_ready():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     job = SpawnedJob("j1", "e1", "t", "r", "/r", "main", None)
     await sup._enqueue(job)
     assert sup._ready_queue.qsize() == 1
@@ -253,6 +303,7 @@ async def test_enqueue_immediate_goes_to_ready():
 @pytest.mark.asyncio
 async def test_enqueue_with_deps_goes_to_pending():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     job = SpawnedJob("j1", "e1", "t", "r", "/r", "main", None,
                      depends_on=frozenset({"dep-1"}))
     await sup._enqueue(job)
@@ -263,6 +314,7 @@ async def test_enqueue_with_deps_goes_to_pending():
 @pytest.mark.asyncio
 async def test_enqueue_with_satisfied_deps_goes_to_ready():
     sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
     sup._completed_jobs.add("dep-1")
     job = SpawnedJob("j1", "e1", "t", "r", "/r", "main", None,
                      depends_on=frozenset({"dep-1"}))
@@ -301,7 +353,7 @@ async def test_handle_job_failed_propagates_to_dependents():
 
     emitted = []
 
-    async def fake_emit(type_, data):
+    async def fake_emit(type_, data, **kwargs):
         emitted.append((type_, data))
 
     sup.client.emit = fake_emit
@@ -405,7 +457,7 @@ async def test_launch_emits_container_identity():
 
     emitted = []
 
-    async def fake_emit(type_, data):
+    async def fake_emit(type_, data, **kwargs):
         emitted.append((type_, data))
 
     sup.client.emit = fake_emit
@@ -487,7 +539,7 @@ async def test_checkpoint_reaps_timed_out_containers():
 
     emitted = []
 
-    async def fake_emit(type_, data):
+    async def fake_emit(type_, data, **kwargs):
         emitted.append((type_, data))
 
     sup.client.emit = fake_emit
@@ -531,7 +583,7 @@ async def test_checkpoint_emits_state():
 
     emitted = []
 
-    async def fake_emit(type_, data):
+    async def fake_emit(type_, data, **kwargs):
         emitted.append((type_, data))
 
     sup.client.emit = fake_emit
@@ -571,9 +623,24 @@ async def test_replay_enqueues_not_launched():
     sup = _make_supervisor()
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "trigger.*":
-            return [_evt("sub-1", "trigger.external",
-                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "supervisor.job.enqueued":
+            return [_evt("q-1", "supervisor.job.enqueued", {
+                "job_id": "job-A",
+                "task_id": "t-1",
+                "source_event_id": "sub-1",
+                "task": "do X",
+                "role": "default",
+                "repo": "/r",
+                "init_branch": "main",
+                "evo_sha": "",
+                "llm": {},
+                "workspace": {},
+                "publication": {},
+                "parent_job_id": "",
+                "condition": None,
+                "job_context": {},
+                "queue_state": "ready",
+            })]
         if type_ == "task.created":
             return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         return []
@@ -589,8 +656,24 @@ async def test_replay_skips_completed():
     sup = _make_supervisor()
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "trigger.*":
-            return [_evt("sub-1", "trigger.external", {"goal": "do X", "context": {"role": "default"}})]
+        if type_ == "supervisor.job.enqueued":
+            return [_evt("q-1", "supervisor.job.enqueued", {
+                "job_id": "job-A",
+                "task_id": "t-1",
+                "source_event_id": "sub-1",
+                "task": "do X",
+                "role": "default",
+                "repo": "/r",
+                "init_branch": "main",
+                "evo_sha": "",
+                "llm": {},
+                "workspace": {},
+                "publication": {},
+                "parent_job_id": "",
+                "condition": None,
+                "job_context": {},
+                "queue_state": "ready",
+            })]
         if type_ == "task.created":
             return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
@@ -619,9 +702,24 @@ async def test_replay_reenqueues_missing_container():
     sup._inspect_replay_state = AsyncMock(return_value=ContainerState(exists=False))
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "trigger.*":
-            return [_evt("sub-1", "trigger.external",
-                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "supervisor.job.enqueued":
+            return [_evt("q-1", "supervisor.job.enqueued", {
+                "job_id": "job-A",
+                "task_id": "t-1",
+                "source_event_id": "sub-1",
+                "task": "do X",
+                "role": "default",
+                "repo": "/r",
+                "init_branch": "main",
+                "evo_sha": "",
+                "llm": {},
+                "workspace": {},
+                "publication": {},
+                "parent_job_id": "",
+                "condition": None,
+                "job_context": {},
+                "queue_state": "ready",
+            })]
         if type_ == "task.created":
             return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
@@ -648,9 +746,24 @@ async def test_replay_reattaches_running_container():
     ))
 
     async def fake_fetch_all(type_, source=None):
-        if type_ == "trigger.*":
-            return [_evt("sub-1", "trigger.external",
-                         {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})]
+        if type_ == "supervisor.job.enqueued":
+            return [_evt("q-1", "supervisor.job.enqueued", {
+                "job_id": "job-A",
+                "task_id": "t-1",
+                "source_event_id": "sub-1",
+                "task": "do X",
+                "role": "default",
+                "repo": "/r",
+                "init_branch": "main",
+                "evo_sha": "",
+                "llm": {},
+                "workspace": {},
+                "publication": {},
+                "parent_job_id": "",
+                "condition": None,
+                "job_context": {},
+                "queue_state": "ready",
+            })]
         if type_ == "task.created":
             return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
@@ -679,7 +792,7 @@ async def test_replay_uses_checkpoint_cursor():
         if type_ == "supervisor.checkpoint":
             return [_evt("cp1", "supervisor.checkpoint",
                          {"cursor": "2026-01-01T00:00:00|saved-cursor"})]
-        if type_ == "trigger.*" or type_ == "task.created":
+        if type_ == "supervisor.job.enqueued" or type_ == "task.created":
             return []
         return []
 

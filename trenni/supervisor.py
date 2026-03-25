@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
 from yoitsu_contracts.conditions import condition_from_data, condition_to_data
+from yoitsu_contracts.config import JobContextConfig
 from yoitsu_contracts.events import (
     JobCancelledData,
     JobCompletedData,
     JobFailedData,
     SpawnRequestData,
     SupervisorCheckpointData,
+    SupervisorJobEnqueuedData,
     SupervisorJobLaunchedData,
     TriggerData,
     TaskCreatedData,
@@ -239,21 +242,12 @@ class Supervisor:
         )
 
     async def _poll_and_handle(self) -> None:
-        events, next_cursor = await self.client.poll(cursor=self.event_cursor, limit=100)
-        if next_cursor:
-            self.event_cursor = next_cursor
-        elif events:
-            last = events[-1]
-            self.event_cursor = f"{last.ts.isoformat()}|{last.id}"
-
+        events, _ = await self.client.poll(cursor=self.event_cursor, limit=100)
         for event in events:
             await self._handle_event(event)
+            self._advance_cursor_from_event(event)
 
     async def _handle_event(self, event: Event, *, realtime: bool = False, replay: bool = False) -> None:
-        if realtime:
-            self._advance_cursor_from_event(event)
-            self._reset_webhook_poll_deadline()
-
         if event.id:
             async with self._event_processing_lock:
                 if (
@@ -270,6 +264,8 @@ class Supervisor:
                 match event.type:
                     case "job.spawn.request":
                         await self._handle_spawn(event, replay=replay)
+                    case "supervisor.job.enqueued":
+                        await self._handle_job_enqueued(event, replay=replay)
                     case "job.completed" | "job.failed" | "job.cancelled":
                         await self._handle_job_done(event, replay=replay)
                     case "job.started":
@@ -288,6 +284,9 @@ class Supervisor:
                 async with self._event_processing_lock:
                     self._processing_event_ids.discard(event.id)
                     self._processed_event_ids.add(event.id)
+            if realtime:
+                self._advance_cursor_from_event(event)
+                self._reset_webhook_poll_deadline()
 
     async def _handle_trigger(self, event: Event, *, replay: bool = False) -> None:
         if event.id in self._launched_event_ids and not replay:
@@ -298,7 +297,8 @@ class Supervisor:
             logger.warning("Ignoring trigger event %s with no goal", event.id)
             return
 
-        task_id = self._generate_job_id()  # Use UUID7 for root task ID
+        task_id = self._stable_id(kind="root-task", source_event_id=event.id)
+        root_job_id = self._stable_id(kind="root-job", source_event_id=event.id)
 
         self.scheduler.record_task_submission(
             task_id=task_id,
@@ -315,9 +315,12 @@ class Supervisor:
                     goal=data.goal,
                     source_trigger_id=event.id,
                 ).model_dump(mode="json"),
+                idempotency_key=self._event_idempotency_key(
+                    source_event_id=event.id,
+                    event_type="task.created",
+                    entity_id=task_id,
+                ),
             )
-
-        self._launched_event_ids.add(event.id)
 
         # Context might define execution details, otherwise use defaults
         role = data.context.get("role", "default")
@@ -327,7 +330,7 @@ class Supervisor:
 
         cancelled = await self._enqueue(
             SpawnedJob(
-                job_id=self._generate_job_id(),
+                job_id=root_job_id,
                 source_event_id=event.id,
                 task=data.goal,
                 role=role,
@@ -343,6 +346,7 @@ class Supervisor:
         )
         if cancelled and not replay:
             await self._emit_cancellations(cancelled, reason="Initial condition is impossible")
+        self._launched_event_ids.add(event.id)
 
     async def _handle_spawn(self, event: Event, *, replay: bool = False) -> None:
         payload = SpawnRequestData.model_validate(event.data)
@@ -362,6 +366,11 @@ class Supervisor:
                         goal=task.goal,
                         source_trigger_id=task.source_event_id,
                     ).model_dump(mode="json"),
+                    idempotency_key=self._event_idempotency_key(
+                        source_event_id=event.id,
+                        event_type="task.created",
+                        entity_id=task.task_id,
+                    ),
                 )
 
         cancelled: list[SpawnedJob] = []
@@ -373,11 +382,72 @@ class Supervisor:
 
     async def _enqueue(self, job: SpawnedJob, *, replay: bool = False) -> list[SpawnedJob]:
         cancelled = await self.scheduler.enqueue(job)
+        queue_state = "cancelled" if cancelled else "pending" if job.job_id in self._pending else "ready"
+
+        if not replay:
+            await self.client.emit(
+                "supervisor.job.enqueued",
+                SupervisorJobEnqueuedData(
+                    job_id=job.job_id,
+                    task_id=job.task_id or job.job_id,
+                    source_event_id=job.source_event_id,
+                    task=job.task,
+                    role=job.role,
+                    repo=job.repo,
+                    init_branch=job.init_branch,
+                    evo_sha=job.evo_sha or "",
+                    llm=dict(job.llm_overrides),
+                    workspace=dict(job.workspace_overrides),
+                    publication=dict(job.publication_overrides),
+                    parent_job_id=job.parent_job_id,
+                    condition=condition_to_data(job.condition),
+                    job_context=job.job_context.model_dump(mode="json"),
+                    queue_state=queue_state,
+                ).model_dump(mode="json"),
+                idempotency_key=self._event_idempotency_key(
+                    source_event_id=job.source_event_id,
+                    event_type="supervisor.job.enqueued",
+                    entity_id=job.job_id,
+                ),
+            )
+
         if job.job_id in self._pending:
             logger.debug("Pending job %s waiting on condition", job.job_id)
         elif not cancelled:
             logger.debug("Queued job %s", job.job_id)
         return [] if replay else cancelled
+
+    async def _handle_job_enqueued(self, event: Event, *, replay: bool = False) -> None:
+        if not replay:
+            return
+
+        data = SupervisorJobEnqueuedData.model_validate(event.data)
+        job = SpawnedJob(
+            job_id=data.job_id,
+            source_event_id=data.source_event_id,
+            task=data.task,
+            role=data.role,
+            repo=data.repo,
+            init_branch=data.init_branch,
+            evo_sha=data.evo_sha or None,
+            llm_overrides=dict(data.llm),
+            workspace_overrides=dict(data.workspace),
+            publication_overrides=dict(data.publication),
+            task_id=data.task_id or data.job_id,
+            condition=condition_from_data(data.condition),
+            parent_job_id=data.parent_job_id,
+            job_context=JobContextConfig.model_validate(data.job_context or {}),
+        )
+
+        if data.queue_state == "cancelled":
+            await self.scheduler.record_job_terminal(
+                job_id=job.job_id,
+                summary="Condition became impossible before launch",
+                cancelled=True,
+            )
+            return
+
+        await self._enqueue(job, replay=True)
 
     async def _handle_job_done(self, event: Event, *, replay: bool = False) -> None:
         job_id = event.data.get("job_id", "")
@@ -697,7 +767,6 @@ class Supervisor:
             return
 
         source_event_id = data.get("source_event_id", "")
-        self.state.discard_scheduled_by_source_event(source_event_id, keep_job_id=job_id)
 
         existing = self.state.jobs_by_id.get(job_id)
         self.state.jobs_by_id[job_id] = existing or SpawnedJob(
@@ -730,6 +799,20 @@ class Supervisor:
         self.state.remove_pending_job(job_id)
         self.state.drop_from_ready_queue(job_id)
 
+
+    @staticmethod
+    def _stable_id(*, kind: str, source_event_id: str) -> str:
+        if source_event_id:
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, f"yoitsu/trenni/{kind}/{source_event_id}"))
+        import uuid_utils
+
+        return str(uuid_utils.uuid7())
+
+    @staticmethod
+    def _event_idempotency_key(*, source_event_id: str, event_type: str, entity_id: str) -> str | None:
+        if not source_event_id:
+            return None
+        return f"trenni:{source_event_id}:{event_type}:{entity_id}"
 
 
     def _generate_job_id(self) -> str:

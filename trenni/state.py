@@ -88,6 +88,9 @@ class SupervisorState:
     def remove_pending_job(self, job_id: str) -> SpawnedJob | None:
         return self.pending_jobs.pop(job_id, None)
 
+    def has_ready_job(self, job_id: str) -> bool:
+        return any(job.job_id == job_id for job in list(self.ready_queue._queue))
+
     def drop_from_ready_queue(self, job_id: str) -> None:
         survivors: list[SpawnedJob] = []
         while True:
