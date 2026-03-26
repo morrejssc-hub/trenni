@@ -181,11 +181,11 @@ class Supervisor:
                 secret=self.config.webhook_secret,
                 event_types=[
                     "trigger.*",
-                    "job.spawn.request",
-                    "job.completed",
-                    "job.failed",
-                    "job.cancelled",
-                    "job.started",
+                    "agent.job.spawn_request",
+                    "agent.job.completed",
+                    "agent.job.failed",
+                    "agent.job.cancelled",
+                    "agent.job.started",
                 ],
             )
             self._webhook_active = True
@@ -249,6 +249,7 @@ class Supervisor:
             task_id=job.task_id or job.job_id,
             task=job.task,
             role=job.role,
+            role_params=job.role_params,
             team=job.team,
             repo=job.repo,
             init_branch=job.init_branch,
@@ -283,17 +284,17 @@ class Supervisor:
                 await self._handle_trigger(event, replay=replay)
             else:
                 match event.type:
-                    case "job.spawn.request":
+                    case "agent.job.spawn_request":
                         await self._handle_spawn(event, replay=replay)
                     case "supervisor.job.enqueued":
                         await self._handle_job_enqueued(event, replay=replay)
-                    case "job.completed" | "job.failed" | "job.cancelled":
+                    case "agent.job.completed" | "agent.job.failed" | "agent.job.cancelled":
                         await self._handle_job_done(event, replay=replay)
-                    case "job.started":
+                    case "agent.job.started":
                         await self._handle_job_started(event, replay=replay)
                     case "supervisor.job.launched":
                         self._register_replayed_launch(event)
-                    case "task.created" | "task.evaluating" | "task.completed" | "task.failed" | "task.partial" | "task.cancelled" | "task.eval_failed":
+                    case "supervisor.task.created" | "supervisor.task.evaluating" | "supervisor.task.completed" | "supervisor.task.failed" | "supervisor.task.partial" | "supervisor.task.cancelled" | "supervisor.task.eval_failed":
                         pass  # State rebuilt naturally via replay if needed, but handled directly in Trigger/Done for realtime
         except Exception:
             if event.id:
@@ -333,7 +334,7 @@ class Supervisor:
 
         if not replay:
             await self.client.emit(
-                "task.created",
+                "supervisor.task.created",
                 TaskCreatedData(
                     task_id=task_id,
                     team=team,
@@ -342,7 +343,7 @@ class Supervisor:
                 ).model_dump(mode="json"),
                 idempotency_key=self._event_idempotency_key(
                     source_event_id=event.id,
-                    event_type="task.created",
+                    event_type="supervisor.task.created",
                     entity_id=task_id,
                 ),
             )
@@ -350,6 +351,10 @@ class Supervisor:
         # Context might define execution details, otherwise use defaults
         team_def = self._resolve_team_definition(team)
         role = data.context.get("role") or data.context.get("planner_role") or team_def.planner_role or "planner"
+        role_params = dict(data.context.get("params", {}))
+        role_params.setdefault("goal", data.goal)
+        if "budget" in data.context:
+            role_params.setdefault("budget", data.context["budget"])
         repo = data.context.get("repo", "")
         init_branch = data.context.get("init_branch", "main")
         evo_sha = data.context.get("evo_sha")
@@ -360,6 +365,7 @@ class Supervisor:
                 source_event_id=event.id,
                 task=data.goal,
                 role=role,
+                role_params=role_params,
                 repo=repo,
                 init_branch=init_branch,
                 evo_sha=evo_sha,
@@ -386,7 +392,7 @@ class Supervisor:
             if not replay:
                 parent_id = task.task_id.rsplit('/', 1)[0]
                 await self.client.emit(
-                    "task.created",
+                    "supervisor.task.created",
                     TaskCreatedData(
                         task_id=task.task_id,
                         parent_task_id=parent_id,
@@ -397,7 +403,7 @@ class Supervisor:
                     ).model_dump(mode="json"),
                     idempotency_key=self._event_idempotency_key(
                         source_event_id=event.id,
-                        event_type="task.created",
+                        event_type="supervisor.task.created",
                         entity_id=task.task_id,
                     ),
                 )
@@ -428,6 +434,7 @@ class Supervisor:
                     source_event_id=job.source_event_id,
                     task=job.task,
                     role=job.role,
+                    role_params=dict(job.role_params),
                     team=job.team,
                     repo=job.repo,
                     init_branch=job.init_branch,
@@ -463,6 +470,7 @@ class Supervisor:
             source_event_id=data.source_event_id,
             task=data.task,
             role=data.role,
+            role_params=dict(data.role_params),
             team=data.team,
             repo=data.repo,
             init_branch=data.init_branch,
@@ -491,8 +499,8 @@ class Supervisor:
         if not job_id:
             return
 
-        is_failure = event.type == "job.failed"
-        is_cancelled = event.type == "job.cancelled"
+        is_failure = event.type == "agent.job.failed"
+        is_cancelled = event.type == "agent.job.cancelled"
         summary = (
             event.data.get("summary")
             or event.data.get("error")
@@ -556,7 +564,7 @@ class Supervisor:
             task.eval_job_id = eval_job_id
             task.state = "evaluating"
             await self.client.emit(
-                "task.evaluating",
+                "supervisor.task.evaluating",
                 TaskEvaluatingData(task_id=task_id, eval_job_id=eval_job_id, result=result).model_dump(mode="json"),
             )
             await self._enqueue(self._build_eval_job(task, eval_job_id), replay=False)
@@ -578,7 +586,7 @@ class Supervisor:
             trace=self._build_task_trace(task.task_id),
         )
 
-        if event.type == "job.completed":
+        if event.type == "agent.job.completed":
             result.semantic = self._semantic_from_eval_event(event.data)
             task.result = result
             final_state = self._semantic_terminal_state(result.semantic, result.structural)
@@ -596,7 +604,7 @@ class Supervisor:
         await self.scheduler.mark_task_terminal(task_id=task.task_id, state="eval_failed")
         task.state = "eval_failed"
         await self.client.emit(
-            "task.eval_failed",
+            "supervisor.task.eval_failed",
             TaskEvalFailedData(task_id=task.task_id, reason=reason, result=result).model_dump(mode="json"),
         )
 
@@ -613,7 +621,7 @@ class Supervisor:
                 or next((entry.summary for entry in reversed(result.trace) if entry.summary), "")
             )
             await self.client.emit(
-                "task.completed",
+                "supervisor.task.completed",
                 TaskCompletedData(task_id=task_id, summary=summary, result=result).model_dump(mode="json"),
             )
             return
@@ -621,7 +629,7 @@ class Supervisor:
         if state == "failed":
             fail_reason = reason or result.semantic.summary or "Task failed"
             await self.client.emit(
-                "task.failed",
+                "supervisor.task.failed",
                 TaskFailedData(task_id=task_id, reason=fail_reason, result=result).model_dump(mode="json"),
             )
             await self._cascade_cancel(task_id, reason=f"Parent or sibling failed: {fail_reason}")
@@ -630,7 +638,7 @@ class Supervisor:
         if state == "partial":
             partial_reason = reason or result.semantic.summary or "Task budget exhausted before completion"
             await self.client.emit(
-                "task.partial",
+                "supervisor.task.partial",
                 TaskPartialData(task_id=task_id, reason=partial_reason, result=result).model_dump(mode="json"),
             )
             return
@@ -638,14 +646,14 @@ class Supervisor:
         if state == "cancelled":
             cancel_reason = reason or "Task cancelled"
             await self.client.emit(
-                "task.cancelled",
+                "supervisor.task.cancelled",
                 TaskCancelledData(task_id=task_id, reason=cancel_reason, result=result).model_dump(mode="json"),
             )
             await self._cascade_cancel(task_id, reason=f"Parent or sibling cancelled: {cancel_reason}")
             return
 
         await self.client.emit(
-            "task.eval_failed",
+            "supervisor.task.eval_failed",
             TaskEvalFailedData(task_id=task_id, reason=reason or "Eval failed", result=result).model_dump(mode="json"),
         )
 
@@ -782,7 +790,7 @@ class Supervisor:
                 await self.scheduler.mark_task_terminal(task_id=tid, state="cancelled")
                 record.state = "cancelled"
                 await self.client.emit(
-                    "task.cancelled",
+                    "supervisor.task.cancelled",
                     TaskCancelledData(
                         task_id=tid,
                         reason=reason,
@@ -822,8 +830,8 @@ class Supervisor:
                 "code": "runtime_lost",
                 "logs_tail": logs[-4000:],
             }
-            event = SimpleNamespace(id="", source_id="", type="job.failed", data=event_data)
-            await self.client.emit("job.failed", event_data)
+            event = SimpleNamespace(id="", source_id="", type="agent.job.failed", data=event_data)
+            await self.client.emit("agent.job.failed", event_data)
             await self._cleanup_handle(handle, failed=True)
             await self._evaluate_task_termination(job_id=handle.job_id, task_id=task_id, event=event)
 
@@ -877,6 +885,7 @@ class Supervisor:
         parent_job_id: str = "",
         condition=None,
         team: str = "default",
+        role_params: dict[str, Any] | None = None,
     ) -> None:
         spec = self.runtime_builder.build(
             job_id=job_id,
@@ -884,6 +893,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            role_params=role_params,
             team=team,
             repo=repo,
             init_branch=init_branch,
@@ -906,6 +916,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            role_params=dict(role_params or {}),
             team=team,
             repo=repo,
             init_branch=init_branch,
@@ -922,6 +933,7 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             role=role,
+            role_params=dict(role_params or {}),
             team=team,
             evo_sha=evo_sha,
             llm_overrides=dict(llm_overrides or {}),
@@ -936,6 +948,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            role_params=dict(role_params or {}),
             team=team,
             repo=repo,
             init_branch=init_branch,
@@ -973,7 +986,7 @@ class Supervisor:
         for job in jobs:
             task_id = job.task_id or job.job_id
             await self.client.emit(
-                "job.cancelled",
+                "agent.job.cancelled",
                 JobCancelledData(job_id=job.job_id, task_id=task_id, reason=reason).model_dump(mode="json"),
             )
             await self.scheduler.record_job_terminal(job_id=job.job_id, summary=reason, cancelled=True)
@@ -981,7 +994,7 @@ class Supervisor:
             await self._evaluate_task_termination(
                 job_id=job.job_id, 
                 task_id=task_id, 
-                event=SimpleNamespace(id="", type="job.cancelled", source_id="", data={"reason": reason})
+                event=SimpleNamespace(id="", type="agent.job.cancelled", source_id="", data={"reason": reason})
             )
 
     def _poll_due_now(self) -> bool:
@@ -1034,34 +1047,57 @@ class Supervisor:
 
     def _resolve_team_definition(self, name: str):
         team_name = (name or "default").strip() or "default"
-        py_path = self._team_root() / "teams" / f"{team_name}.py"
-        if not py_path.exists():
+        roles_dir = self._team_root() / "roles"
+        members: list[dict[str, Any]] = []
+        if roles_dir.exists():
+            for py_path in sorted(roles_dir.glob("*.py")):
+                if py_path.name.startswith("_"):
+                    continue
+                module_ast = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+                for node in module_ast.body:
+                    if not isinstance(node, ast.FunctionDef):
+                        continue
+                    for deco in node.decorator_list:
+                        if not isinstance(deco, ast.Call):
+                            continue
+                        func = deco.func
+                        if not isinstance(func, ast.Name) or func.id != "role":
+                            continue
+                        keywords = {kw.arg: ast.literal_eval(kw.value) for kw in deco.keywords if kw.arg is not None}
+                        teams = list(keywords.get("teams", ["default"]))
+                        if team_name not in teams:
+                            continue
+                        members.append(
+                            {
+                                "name": keywords.get("name", node.name),
+                                "description": keywords.get("description", ""),
+                                "role_type": keywords.get("role_type", "worker"),
+                            }
+                        )
+        if not members:
             if team_name == "default":
                 return _DEFAULT_TEAM_DEFINITION
-            logger.warning(
-                "Team definition %s not found at %s; falling back to default planner/evaluator",
-                team_name,
-                py_path,
-            )
-            return SimpleNamespace(**{**_DEFAULT_TEAM_DEFINITION.__dict__, "name": team_name})
+            raise FileNotFoundError(f"No roles found for team {team_name!r}")
 
-        module_ast = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
-        for node in module_ast.body:
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(isinstance(target, ast.Name) and target.id == "team" for target in node.targets):
-                continue
-            if not isinstance(node.value, ast.Call):
-                continue
-            keywords = {kw.arg: ast.literal_eval(kw.value) for kw in node.value.keywords if kw.arg is not None}
-            return SimpleNamespace(
-                name=keywords.get("name", team_name),
-                description=keywords.get("description", ""),
-                roles=list(keywords.get("roles", [])),
-                planner_role=keywords.get("planner_role", "planner"),
-                eval_role=keywords.get("eval_role", "evaluator"),
-            )
-        raise ValueError(f"No TeamDefinition-like object found in {py_path}")
+        planners = [member["name"] for member in members if member["role_type"] == "planner"]
+        evaluators = [member["name"] for member in members if member["role_type"] == "evaluator"]
+        workers = [member["name"] for member in members if member["role_type"] == "worker"]
+
+        if len(planners) != 1:
+            raise ValueError(f"Team {team_name!r} must have exactly one planner role")
+        if len(evaluators) > 1:
+            raise ValueError(f"Team {team_name!r} must have at most one evaluator role")
+        if not workers:
+            raise ValueError(f"Team {team_name!r} must have at least one worker role")
+
+        return SimpleNamespace(
+            name=team_name,
+            description=f"Derived team {team_name}",
+            roles=[member["name"] for member in members],
+            planner_role=planners[0],
+            eval_role=evaluators[0] if evaluators else _DEFAULT_TEAM_DEFINITION.eval_role,
+            worker_roles=workers,
+        )
 
     def _register_replayed_launch(self, event: Event) -> None:
         data = event.data

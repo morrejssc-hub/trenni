@@ -22,17 +22,17 @@ async def rebuild_state(supervisor) -> None:
     fetch_plan = [
         ("supervisor.job.enqueued", supervisor.config.source_id),
         ("supervisor.job.launched", supervisor.config.source_id),
-        ("job.started", None),
-        ("job.completed", None),
-        ("job.failed", None),
-        ("job.cancelled", None),
-        ("task.created", None),
-        ("task.evaluating", None),
-        ("task.completed", None),
-        ("task.failed", None),
-        ("task.partial", None),
-        ("task.cancelled", None),
-        ("task.eval_failed", None),
+        ("agent.job.started", None),
+        ("agent.job.completed", None),
+        ("agent.job.failed", None),
+        ("agent.job.cancelled", None),
+        ("supervisor.task.created", None),
+        ("supervisor.task.evaluating", None),
+        ("supervisor.task.completed", None),
+        ("supervisor.task.failed", None),
+        ("supervisor.task.partial", None),
+        ("supervisor.task.cancelled", None),
+        ("supervisor.task.eval_failed", None),
     ]
 
     all_events = []
@@ -47,11 +47,11 @@ async def rebuild_state(supervisor) -> None:
     for event in all_events:
         if event.type == "supervisor.job.launched":
             launched_by_job[event.data.get("job_id", "")] = event
-        elif event.type == "job.started" and event.data.get("job_id"):
+        elif event.type == "agent.job.started" and event.data.get("job_id"):
             started_job_ids.add(event.data["job_id"])
-        elif event.type in {"job.completed", "job.failed", "job.cancelled"} and event.data.get("job_id"):
+        elif event.type in {"agent.job.completed", "agent.job.failed", "agent.job.cancelled"} and event.data.get("job_id"):
             finished_job_ids.add(event.data["job_id"])
-        elif event.type == "task.created":
+        elif event.type == "supervisor.task.created":
             task_id = event.data.get("task_id", "")
             if task_id and task_id not in supervisor.state.tasks:
                 supervisor.scheduler.record_task_submission(
@@ -68,7 +68,7 @@ async def rebuild_state(supervisor) -> None:
                 task = supervisor.state.tasks.get(task_id)
                 if task is not None:
                     task.team = event.data.get("team", "default")
-        elif event.type == "task.evaluating":
+        elif event.type == "supervisor.task.evaluating":
             task_id = event.data.get("task_id", "")
             task = supervisor.state.tasks.get(task_id)
             if task is not None:
@@ -77,10 +77,10 @@ async def rebuild_state(supervisor) -> None:
                 task.eval_job_id = event.data.get("eval_job_id", "")
                 if event.data.get("result"):
                     task.result = TaskResult.model_validate(event.data["result"])
-        elif event.type in {"task.completed", "task.failed", "task.partial", "task.cancelled", "task.eval_failed"}:
+        elif event.type in {"supervisor.task.completed", "supervisor.task.failed", "supervisor.task.partial", "supervisor.task.cancelled", "supervisor.task.eval_failed"}:
             task_id = event.data.get("task_id", "")
             if task_id:
-                state = "eval_failed" if event.type == "task.eval_failed" else event.type.split(".")[1]
+                state = "eval_failed" if event.type == "supervisor.task.eval_failed" else event.type.rsplit(".", 1)[-1]
                 await supervisor.scheduler.mark_task_terminal(task_id=task_id, state=state)
                 task = supervisor.state.tasks.get(task_id)
                 if task is not None:
@@ -119,7 +119,7 @@ async def rebuild_state(supervisor) -> None:
                 "error": "Container disappeared before a terminal event was emitted",
                 "code": "runtime_lost",
             }
-            await supervisor.client.emit("job.failed", event_data)
+            await supervisor.client.emit("agent.job.failed", event_data)
             await supervisor.scheduler.record_job_terminal(
                 job_id=job_id,
                 summary="Container disappeared before a terminal event was emitted",
@@ -129,7 +129,7 @@ async def rebuild_state(supervisor) -> None:
             await supervisor._evaluate_task_termination(
                 job_id=job_id,
                 task_id=job.task_id,
-                event=SimpleNamespace(id="", source_id="", type="job.failed", data=event_data),
+                event=SimpleNamespace(id="", source_id="", type="agent.job.failed", data=event_data),
             )
             continue
 

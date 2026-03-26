@@ -38,11 +38,11 @@ class SpawnHandler:
         parent_task_id = parent_job.task_id if parent_job and parent_job.task_id else parent_job_id
         wait_for, on_fail = self._normalize_strategy(payload.wait_for, payload.on_fail)
         child_defs: list[
-            tuple[str, str, str, str, str, str, str | None, dict, dict, dict, str, EvalSpec | None]
+            tuple[str, str, str, str, dict, str, str, str | None, dict, dict, dict, str, EvalSpec | None]
         ] = []
 
         for index, child in enumerate(payload.tasks):
-            prompt = child.prompt.strip()
+            prompt = (child.goal or child.prompt).strip()
             if not prompt:
                 continue
 
@@ -51,13 +51,20 @@ class SpawnHandler:
             job_id = f"{parent_job_id}-c{token}"
             spec = child.job_spec
 
-            role = spec.role or self._inherit("role", parent_job, parent_defaults, "default")
+            role = child.role or spec.role or self._inherit("role", parent_job, parent_defaults, "default")
+            role_params = dict(child.params or {})
+            role_params.setdefault("goal", prompt)
+            if child.budget:
+                role_params.setdefault("budget", float(child.budget))
             repo = spec.repo or self._inherit("repo", parent_job, parent_defaults, "")
             init_branch = spec.init_branch or self._inherit("init_branch", parent_job, parent_defaults, "main")
-            evo_sha = spec.evo_sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
+            evo_sha = child.sha or spec.evo_sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
 
             llm = dict(self._inherit("llm_overrides", parent_job, parent_defaults, {}))
             llm.update(dict(spec.llm))
+            if child.budget and "max_total_cost" not in llm:
+                llm["max_total_cost"] = float(child.budget)
+                llm.setdefault("max_iterations", 0)
 
             workspace = dict(self._inherit("workspace_overrides", parent_job, parent_defaults, {}))
             workspace.update(dict(spec.workspace))
@@ -72,6 +79,7 @@ class SpawnHandler:
                     job_id,
                     prompt,
                     role,
+                    role_params,
                     repo,
                     init_branch,
                     evo_sha,
@@ -91,6 +99,7 @@ class SpawnHandler:
                 source_event_id=event.id,
                 spec={
                     "role": role,
+                    "role_params": role_params,
                     "team": team,
                     "repo": repo,
                     "init_branch": init_branch,
@@ -99,11 +108,11 @@ class SpawnHandler:
                 team=team,
                 eval_spec=eval_spec,
             )
-            for task_id, _, prompt, role, repo, init_branch, evo_sha, *_, team, eval_spec in child_defs
+            for task_id, _, prompt, role, role_params, repo, init_branch, evo_sha, *_, team, eval_spec in child_defs
         ]
 
         jobs: list[SpawnedJob] = []
-        for task_id, job_id, prompt, role, repo, init_branch, evo_sha, llm, workspace, publication, team, _ in child_defs:
+        for task_id, job_id, prompt, role, role_params, repo, init_branch, evo_sha, llm, workspace, publication, team, _ in child_defs:
             sibling_ids = [candidate for candidate in child_task_ids if candidate != task_id]
             guard_conditions = []
 
@@ -137,6 +146,7 @@ class SpawnHandler:
                     source_event_id=event.id,
                     task=prompt,
                     role=role,
+                    role_params=role_params,
                     repo=repo,
                     init_branch=init_branch,
                     evo_sha=evo_sha,
@@ -158,6 +168,7 @@ class SpawnHandler:
                     source_event_id=event.id,
                     task=parent_job.task,
                     role=parent_job.role,
+                    role_params=dict(parent_job.role_params),
                     repo=parent_job.repo,
                     init_branch=parent_job.init_branch,
                     evo_sha=parent_job.evo_sha,

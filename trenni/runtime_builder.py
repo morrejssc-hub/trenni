@@ -52,6 +52,7 @@ class RuntimeSpecBuilder:
         source_event_id: str,
         task: str,
         role: str,
+        role_params: dict | None = None,
         team: str = "default",
         repo: str,
         init_branch: str,
@@ -73,6 +74,7 @@ class RuntimeSpecBuilder:
                 "task_id": task_id or job_id,
                 "task": task,
                 "role": role,
+                "role_params": dict(role_params or {}),
                 "team": team,
                 "workspace": merged_workspace,
                 "llm": {

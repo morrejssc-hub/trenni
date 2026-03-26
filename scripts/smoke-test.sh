@@ -257,7 +257,7 @@ while [[ $ELAPSED -lt $JOB_TIMEOUT ]]; do
 import sys, json
 events = json.load(sys.stdin)
 for e in events:
-    if e['type'] in ('job.completed', 'job.failed') and e['data'].get('job_id') == '$JOB_ID':
+    if e['type'] in ('agent.job.completed', 'agent.job.failed') and e['data'].get('job_id') == '$JOB_ID':
         print(e['type'])
         break
 " 2>/dev/null || true)
@@ -289,7 +289,7 @@ for e in events:
     extra = ''
     if typ == 'supervisor.job.launched':
         extra = f' container_id={e[\"data\"].get(\"container_id\",\"?\")} role={e[\"data\"].get(\"role\",\"?\")}'
-    elif typ in ('job.completed', 'job.failed'):
+    elif typ in ('agent.job.completed', 'agent.job.failed'):
         extra = f' summary={e[\"data\"].get(\"summary\",\"(none)\")[:80]}'
     print(f'  [{src}] {typ} {job}{extra}')
 " 2>/dev/null || warn "无法获取事件"
@@ -297,10 +297,10 @@ for e in events:
 echo ""
 
 # 最终判定
-if [[ "$FINAL_STATUS" == "job.completed" ]]; then
+if [[ "$FINAL_STATUS" == "agent.job.completed" ]]; then
     ok "Job 完成！端到端测试通过"
     exit 0
-elif [[ "$FINAL_STATUS" == "job.failed" ]]; then
+elif [[ "$FINAL_STATUS" == "agent.job.failed" ]]; then
     warn "Job 失败（但流程跑通了）"
     info "查看 trenni 日志: $WORK_DIR/trenni.log"
     exit 1

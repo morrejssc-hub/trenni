@@ -58,7 +58,7 @@ def test_supervisor_has_ready_queue_and_dedup():
 async def test_handle_trigger_enqueues():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
-    event = _evt("evt-abc", "trigger.external",
+    event = _evt("evt-abc", "trigger.external.received",
                  {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})
 
     await sup._handle_trigger(event)
@@ -82,7 +82,7 @@ async def test_handle_trigger_with_team_defaults_to_planner_role():
             roles=["implementer"],
         )
     )
-    event = _evt("evt-team", "trigger.external", {"goal": "plan X", "team": "backend", "context": {}})
+    event = _evt("evt-team", "trigger.external.received", {"goal": "plan X", "team": "backend", "context": {}})
 
     await sup._handle_trigger(event)
 
@@ -96,7 +96,7 @@ async def test_handle_trigger_deduplicates():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
     sup._launched_event_ids.add("evt-dup")
-    event = _evt("evt-dup", "trigger.external",
+    event = _evt("evt-dup", "trigger.external.received",
                  {"goal": "do X", "context": {"role": "default"}})
 
     await sup._handle_trigger(event)
@@ -107,7 +107,7 @@ async def test_handle_trigger_deduplicates():
 async def test_handle_trigger_ignores_empty_goal():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
-    event = _evt("evt-empty", "trigger.external", {"goal": "", "context": {"role": "default"}})
+    event = _evt("evt-empty", "trigger.external.received", {"goal": "", "context": {"role": "default"}})
 
     await sup._handle_trigger(event)
     assert sup._ready_queue.qsize() == 0
@@ -125,7 +125,7 @@ async def test_handle_spawn_creates_children_no_continuation():
         evo_sha="parent-sha",
         task_id="task-1",
     )
-    event = _evt("spawn-1", "job.spawn.request", {
+    event = _evt("spawn-1", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
             {"prompt": "child A", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
@@ -151,7 +151,7 @@ async def test_handle_spawn_creates_children_no_continuation():
 @pytest.mark.asyncio
 async def test_handle_spawn_empty_tasks_ignored():
     sup = _make_supervisor()
-    event = _evt("spawn-empty", "job.spawn.request", {
+    event = _evt("spawn-empty", "agent.job.spawn_request", {
         "job_id": "parent-2",
         "tasks": [],
     })
@@ -171,7 +171,7 @@ async def test_handle_event_deduplicates_spawn_request():
         evo_sha="parent-sha",
         task_id="task-1",
     )
-    event = _evt("spawn-dup", "job.spawn.request", {
+    event = _evt("spawn-dup", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
             {"prompt": "child A", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
@@ -199,7 +199,7 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields
         workspace_overrides={"depth": 2},
         publication_overrides={"branch_prefix": "parent/job"},
     )
-    event = _evt("spawn-inherit", "job.spawn.request", {
+    event = _evt("spawn-inherit", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
             {"prompt": "child task", "job_spec": {"role": "worker", "workspace": {"depth": 3}}},
@@ -250,7 +250,7 @@ async def test_handle_event_realtime_advances_cursor_and_delays_poll():
     sup = _make_supervisor()
     sup._webhook_active = True
     sup.event_cursor = "2026-01-01T00:00:00|old"
-    event = _evt("evt-new", "job.started", {"job_id": "job-1"})
+    event = _evt("evt-new", "agent.job.started", {"job_id": "job-1"})
 
     await sup._handle_event(event, realtime=True)
 
@@ -264,7 +264,7 @@ async def test_handle_event_marks_processed_only_after_success():
     sup.client.emit = AsyncMock()
     event = _evt(
         "evt-retry",
-        "trigger.external",
+        "trigger.external.received",
         {"goal": "do X", "context": {"role": "default"}},
     )
 
@@ -295,8 +295,8 @@ async def test_poll_and_handle_advances_cursor_only_after_successful_intake():
     sup = _make_supervisor()
     t0 = datetime.fromisoformat("2026-01-01T00:00:00")
     t1 = datetime.fromisoformat("2026-01-01T00:00:01")
-    event_ok = Event(id="evt-1", source_id="test", type="job.started", ts=t0, data={"job_id": "j1"})
-    event_fail = Event(id="evt-2", source_id="test", type="job.started", ts=t1, data={"job_id": "j2"})
+    event_ok = Event(id="evt-1", source_id="test", type="agent.job.started", ts=t0, data={"job_id": "j1"})
+    event_fail = Event(id="evt-2", source_id="test", type="agent.job.started", ts=t1, data={"job_id": "j2"})
 
     async def fake_poll(cursor=None, source=None, type_=None, limit=100):
         return [event_ok, event_fail], "ignored-next-cursor"
@@ -380,14 +380,14 @@ async def test_handle_job_done_resolves_pending():
                          depends_on=frozenset({"p-c0", "p-c1"}))
     sup._pending["p-join"] = dep_job
 
-    await sup._handle_job_done(_evt("d1", "job.completed", {
+    await sup._handle_job_done(_evt("d1", "agent.job.completed", {
         "job_id": "p-c0", "summary": "done A",
     }))
     assert "p-c0" in sup._completed_jobs
     assert sup._ready_queue.qsize() == 0
     assert "p-join" in sup._pending
 
-    await sup._handle_job_done(_evt("d2", "job.completed", {
+    await sup._handle_job_done(_evt("d2", "agent.job.completed", {
         "job_id": "p-c1", "summary": "done B",
     }))
     assert sup._ready_queue.qsize() == 1
@@ -411,7 +411,7 @@ async def test_handle_job_failed_propagates_to_dependents():
                          depends_on=frozenset({"p-c0", "p-c1"}))
     sup._pending["p-join"] = dep_job
 
-    await sup._handle_job_done(_evt("d1", "job.failed", {
+    await sup._handle_job_done(_evt("d1", "agent.job.failed", {
         "job_id": "p-c0", "error": "crash",
     }))
 
@@ -421,7 +421,7 @@ async def test_handle_job_failed_propagates_to_dependents():
     assert "p-join" not in sup._pending
     assert "p-join" in sup.state.cancelled_jobs
 
-    cancel_events = [(t, d) for t, d in emitted if t == "job.cancelled"]
+    cancel_events = [(t, d) for t, d in emitted if t == "agent.job.cancelled"]
     assert len(cancel_events) == 1
     assert cancel_events[0][1]["job_id"] == "p-join"
     assert cancel_events[0][1]["code"] == "condition_unsatisfied"
@@ -430,7 +430,7 @@ async def test_handle_job_failed_propagates_to_dependents():
 @pytest.mark.asyncio
 async def test_handle_job_done_caches_summary():
     sup = _make_supervisor()
-    await sup._handle_job_done(_evt("d1", "job.completed", {
+    await sup._handle_job_done(_evt("d1", "agent.job.completed", {
         "job_id": "j1", "summary": "all good",
     }))
     assert sup._job_summaries["j1"] == "all good"
@@ -443,15 +443,15 @@ async def test_handle_job_budget_exhausted_emits_task_partial():
     sup.state.tasks["t1"] = TaskRecord(task_id="t1", goal="goal")
     sup.state.jobs_by_id["j1"] = SpawnedJob("j1", "e1", "goal", "default", "/r", "main", None, task_id="t1")
 
-    await sup._handle_job_done(_evt("d1", "job.completed", {
+    await sup._handle_job_done(_evt("d1", "agent.job.completed", {
         "job_id": "j1",
         "summary": "stopped at budget",
         "code": "budget_exhausted",
     }))
 
     emitted = [call.args for call in sup.client.emit.await_args_list]
-    assert any(event_type == "task.partial" for event_type, _ in emitted)
-    payload = next(data for event_type, data in emitted if event_type == "task.partial")
+    assert any(event_type == "supervisor.task.partial" for event_type, _ in emitted)
+    payload = next(data for event_type, data in emitted if event_type == "supervisor.task.partial")
     assert payload["task_id"] == "t1"
     assert payload["result"]["structural"]["partial"] == 1
 
@@ -465,7 +465,7 @@ async def test_handle_job_done_removes_from_jobs():
     sup.backend.remove = AsyncMock()
     sup.jobs["j1"] = JobHandle("j1", "ctr-1", "yoitsu-job-j1")
 
-    await sup._handle_job_done(_evt("d1", "job.completed", {"job_id": "j1"}))
+    await sup._handle_job_done(_evt("d1", "agent.job.completed", {"job_id": "j1"}))
     assert "j1" not in sup.jobs
     sup.backend.stop.assert_awaited_once()
     sup.backend.remove.assert_awaited_once()
@@ -637,10 +637,10 @@ async def test_checkpoint_reaps_timed_out_containers():
 
     assert "j1" not in sup.jobs
     types = [e[0] for e in emitted]
-    assert "job.failed" in types
-    assert "task.failed" in types
+    assert "agent.job.failed" in types
+    assert "supervisor.task.failed" in types
     assert "supervisor.checkpoint" in types
-    fail_data = next(d for t, d in emitted if t == "job.failed")
+    fail_data = next(d for t, d in emitted if t == "agent.job.failed")
     assert fail_data["code"] == "runtime_lost"
     assert "container log line" in fail_data["logs_tail"]
     sup.backend.stop.assert_awaited_once()
@@ -670,9 +670,9 @@ async def test_checkpoint_emits_state():
 @pytest.mark.asyncio
 async def test_fetch_all_paginates():
     sup = _make_supervisor()
-    page1 = ([_evt("e1", "job.started", {"job_id": "e1"}),
-              _evt("e2", "job.started", {"job_id": "e2"})], "cursor-2")
-    page2 = ([_evt("e3", "job.started", {"job_id": "e3"})], None)
+    page1 = ([_evt("e1", "agent.job.started", {"job_id": "e1"}),
+              _evt("e2", "agent.job.started", {"job_id": "e2"})], "cursor-2")
+    page2 = ([_evt("e3", "agent.job.started", {"job_id": "e3"})], None)
     pages = [page1, page2]
     call_count = 0
 
@@ -683,7 +683,7 @@ async def test_fetch_all_paginates():
         return result
 
     sup.client.poll = fake_poll
-    events = await sup._fetch_all("job.started")
+    events = await sup._fetch_all("agent.job.started")
     assert [e.id for e in events] == ["e1", "e2", "e3"]
     assert call_count == 2
 
@@ -711,8 +711,8 @@ async def test_replay_enqueues_not_launched():
                 "job_context": {},
                 "queue_state": "ready",
             })]
-        if type_ == "task.created":
-            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
+        if type_ == "supervisor.task.created":
+            return [_evt("c-1", "supervisor.task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         return []
 
     sup._fetch_all = fake_fetch_all
@@ -744,18 +744,18 @@ async def test_replay_skips_completed():
                 "job_context": {},
                 "queue_state": "ready",
             })]
-        if type_ == "task.created":
-            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
+        if type_ == "supervisor.task.created":
+            return [_evt("c-1", "supervisor.task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1", "job_id": "job-A",
                 "container_id": "ctr-A", "container_name": "yoitsu-job-job-A",
                 "task_id": "t-1", "task": "do X", "role": "default", "repo": "/r"
             })]
-        if type_ == "job.started":
-            return [_evt("s1", "job.started", {"job_id": "job-A"})]
-        if type_ == "job.completed":
-            return [_evt("c1", "job.completed", {"job_id": "job-A", "summary": "ok"})]
+        if type_ == "agent.job.started":
+            return [_evt("s1", "agent.job.started", {"job_id": "job-A"})]
+        if type_ == "agent.job.completed":
+            return [_evt("c1", "agent.job.completed", {"job_id": "job-A", "summary": "ok"})]
         return []
 
     sup._fetch_all = fake_fetch_all
@@ -790,8 +790,8 @@ async def test_replay_reenqueues_missing_container():
                 "job_context": {},
                 "queue_state": "ready",
             })]
-        if type_ == "task.created":
-            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
+        if type_ == "supervisor.task.created":
+            return [_evt("c-1", "supervisor.task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1",
@@ -834,8 +834,8 @@ async def test_replay_reattaches_running_container():
                 "job_context": {},
                 "queue_state": "ready",
             })]
-        if type_ == "task.created":
-            return [_evt("c-1", "task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
+        if type_ == "supervisor.task.created":
+            return [_evt("c-1", "supervisor.task.created", {"task_id": "t-1", "goal": "do X", "source_trigger_id": "sub-1"})]
         if type_ == "supervisor.job.launched":
             return [_evt("l1", "supervisor.job.launched", {
                 "source_event_id": "sub-1",
@@ -862,7 +862,7 @@ async def test_replay_uses_checkpoint_cursor():
         if type_ == "supervisor.checkpoint":
             return [_evt("cp1", "supervisor.checkpoint",
                          {"cursor": "2026-01-01T00:00:00|saved-cursor"})]
-        if type_ == "supervisor.job.enqueued" or type_ == "task.created":
+        if type_ == "supervisor.job.enqueued" or type_ == "supervisor.task.created":
             return []
         return []
 

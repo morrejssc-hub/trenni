@@ -24,6 +24,7 @@ class SpawnedJob:
     repo: str
     init_branch: str
     evo_sha: str | None
+    role_params: dict[str, Any] = field(default_factory=dict)
     llm_overrides: dict[str, Any] = field(default_factory=dict)
     workspace_overrides: dict[str, Any] = field(default_factory=dict)
     publication_overrides: dict[str, Any] = field(default_factory=dict)
@@ -41,6 +42,7 @@ class SpawnDefaults:
     init_branch: str
     role: str
     evo_sha: str | None
+    role_params: dict[str, Any] = field(default_factory=dict)
     llm_overrides: dict[str, Any] = field(default_factory=dict)
     workspace_overrides: dict[str, Any] = field(default_factory=dict)
     publication_overrides: dict[str, Any] = field(default_factory=dict)
