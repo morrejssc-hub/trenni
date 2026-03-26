@@ -52,6 +52,7 @@ class TrenniConfig:
     pasloe_url: str = "http://localhost:8000"
     pasloe_api_key_env: str = "PASLOE_API_KEY"
     source_id: str = "trenni-supervisor"
+    evo_root: str = ""
 
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 

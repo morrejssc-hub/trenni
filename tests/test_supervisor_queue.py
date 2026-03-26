@@ -3,6 +3,7 @@ import asyncio
 import re
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,12 +74,20 @@ async def test_handle_trigger_enqueues():
 async def test_handle_trigger_with_team_defaults_to_planner_role():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
+    sup._resolve_team_definition = MagicMock(
+        return_value=SimpleNamespace(
+            name="backend",
+            planner_role="custom-planner",
+            eval_role="custom-evaluator",
+            roles=["implementer"],
+        )
+    )
     event = _evt("evt-team", "trigger.external", {"goal": "plan X", "team": "backend", "context": {}})
 
     await sup._handle_trigger(event)
 
     job = sup._ready_queue.get_nowait()
-    assert job.role == "planner"
+    assert job.role == "custom-planner"
     assert job.team == "backend"
 
 
@@ -213,6 +222,14 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields
 
 def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
     sup = _make_supervisor()
+    sup._resolve_team_definition = MagicMock(
+        return_value=SimpleNamespace(
+            name="backend",
+            planner_role="planner",
+            eval_role="custom-evaluator",
+            roles=["implementer"],
+        )
+    )
     task = TaskRecord(task_id="t-1", goal="goal", team="backend")
     task.job_order = ["j1"]
     sup.state.tasks["t-1"] = task
@@ -221,7 +238,7 @@ def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
 
     job = sup._build_eval_job(task, "t-1-eval")
 
-    assert job.role == "evaluator"
+    assert job.role == "custom-evaluator"
     assert job.team == "backend"
     assert job.init_branch == "palimpsest/job/j1"
     assert job.workspace_overrides["new_branch"] is False

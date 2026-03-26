@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -49,6 +51,13 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CHECKPOINT_CYCLES = 30
 _CONTROL_EVENT_TIMEOUT_S = 1.0
+_DEFAULT_TEAM_DEFINITION = SimpleNamespace(
+    name="default",
+    description="Default planning and execution team",
+    roles=["default"],
+    planner_role="planner",
+    eval_role="evaluator",
+)
 
 
 class Supervisor:
@@ -339,7 +348,8 @@ class Supervisor:
             )
 
         # Context might define execution details, otherwise use defaults
-        role = data.context.get("role") or data.context.get("planner_role") or "planner"
+        team_def = self._resolve_team_definition(team)
+        role = data.context.get("role") or data.context.get("planner_role") or team_def.planner_role or "planner"
         repo = data.context.get("repo", "")
         init_branch = data.context.get("init_branch", "main")
         evo_sha = data.context.get("evo_sha")
@@ -1017,6 +1027,42 @@ class Supervisor:
         ref = container_id or container_name or f"yoitsu-job-{job_id}"
         return JobHandle(job_id=job_id, container_id=container_id or ref, container_name=container_name or ref)
 
+    def _team_root(self) -> Path:
+        if self.config.evo_root:
+            return Path(self.config.evo_root)
+        return Path(__file__).resolve().parents[2] / "palimpsest" / "evo"
+
+    def _resolve_team_definition(self, name: str):
+        team_name = (name or "default").strip() or "default"
+        py_path = self._team_root() / "teams" / f"{team_name}.py"
+        if not py_path.exists():
+            if team_name == "default":
+                return _DEFAULT_TEAM_DEFINITION
+            logger.warning(
+                "Team definition %s not found at %s; falling back to default planner/evaluator",
+                team_name,
+                py_path,
+            )
+            return SimpleNamespace(**{**_DEFAULT_TEAM_DEFINITION.__dict__, "name": team_name})
+
+        module_ast = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+        for node in module_ast.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "team" for target in node.targets):
+                continue
+            if not isinstance(node.value, ast.Call):
+                continue
+            keywords = {kw.arg: ast.literal_eval(kw.value) for kw in node.value.keywords if kw.arg is not None}
+            return SimpleNamespace(
+                name=keywords.get("name", team_name),
+                description=keywords.get("description", ""),
+                roles=list(keywords.get("roles", [])),
+                planner_role=keywords.get("planner_role", "planner"),
+                eval_role=keywords.get("eval_role", "evaluator"),
+            )
+        raise ValueError(f"No TeamDefinition-like object found in {py_path}")
+
     def _register_replayed_launch(self, event: Event) -> None:
         data = event.data
         job_id = data.get("job_id", "")
@@ -1084,7 +1130,8 @@ class Supervisor:
 
     def _build_eval_job(self, task: TaskRecord, eval_job_id: str) -> SpawnedJob:
         eval_spec = task.eval_spec or EvalSpec()
-        role = eval_spec.role or "evaluator"
+        team_def = self._resolve_team_definition(task.team)
+        role = eval_spec.role or team_def.eval_role or "evaluator"
         base_job = next(
             (
                 self.state.jobs_by_id[job_id]
