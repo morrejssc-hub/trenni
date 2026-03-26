@@ -38,7 +38,7 @@ class SpawnHandler:
         parent_task_id = parent_job.task_id if parent_job and parent_job.task_id else parent_job_id
         wait_for, on_fail = self._normalize_strategy(payload.wait_for, payload.on_fail)
         child_defs: list[
-            tuple[str, str, str, str, str, str, str | None, dict, dict, dict, EvalSpec | None]
+            tuple[str, str, str, str, str, str, str | None, dict, dict, dict, str, EvalSpec | None]
         ] = []
 
         for index, child in enumerate(payload.tasks):
@@ -64,6 +64,7 @@ class SpawnHandler:
 
             publication = dict(self._inherit("publication_overrides", parent_job, parent_defaults, {}))
             publication.update(dict(spec.publication))
+            team = self._inherit("team", parent_job, parent_defaults, "default")
 
             child_defs.append(
                 (
@@ -77,6 +78,7 @@ class SpawnHandler:
                     llm,
                     workspace,
                     publication,
+                    team,
                     child.eval_spec,
                 )
             )
@@ -89,17 +91,19 @@ class SpawnHandler:
                 source_event_id=event.id,
                 spec={
                     "role": role,
+                    "team": team,
                     "repo": repo,
                     "init_branch": init_branch,
                     "evo_sha": evo_sha,
                 },
+                team=team,
                 eval_spec=eval_spec,
             )
-            for task_id, _, prompt, role, repo, init_branch, evo_sha, *_, eval_spec in child_defs
+            for task_id, _, prompt, role, repo, init_branch, evo_sha, *_, team, eval_spec in child_defs
         ]
 
         jobs: list[SpawnedJob] = []
-        for task_id, job_id, prompt, role, repo, init_branch, evo_sha, llm, workspace, publication, _ in child_defs:
+        for task_id, job_id, prompt, role, repo, init_branch, evo_sha, llm, workspace, publication, team, _ in child_defs:
             sibling_ids = [candidate for candidate in child_task_ids if candidate != task_id]
             guard_conditions = []
 
@@ -142,6 +146,7 @@ class SpawnHandler:
                     task_id=task_id,
                     condition=self._combine_conditions(guard_conditions),
                     parent_job_id=parent_job_id,
+                    team=team,
                 )
             )
 
@@ -170,6 +175,7 @@ class SpawnHandler:
                         )
                     ),
                     parent_job_id=parent_job_id,
+                    team=parent_job.team,
                 )
             )
 

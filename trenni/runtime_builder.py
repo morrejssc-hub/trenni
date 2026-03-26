@@ -52,6 +52,7 @@ class RuntimeSpecBuilder:
         source_event_id: str,
         task: str,
         role: str,
+        team: str = "default",
         repo: str,
         init_branch: str,
         evo_sha: str | None,
@@ -72,6 +73,7 @@ class RuntimeSpecBuilder:
                 "task_id": task_id or job_id,
                 "task": task,
                 "role": role,
+                "team": team,
                 "workspace": merged_workspace,
                 "llm": {
                     **self.config.default_llm,

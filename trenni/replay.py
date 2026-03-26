@@ -58,13 +58,16 @@ async def rebuild_state(supervisor) -> None:
                     task_id=task_id,
                     goal=event.data.get("goal", ""),
                     source_event_id=event.data.get("source_trigger_id", ""),
-                    spec={},
+                    spec={"team": event.data.get("team", "default")},
                     eval_spec=(
                         EvalSpec.model_validate(event.data.get("eval_spec"))
                         if event.data.get("eval_spec")
                         else None
                     ),
                 )
+                task = supervisor.state.tasks.get(task_id)
+                if task is not None:
+                    task.team = event.data.get("team", "default")
         elif event.type == "task.evaluating":
             task_id = event.data.get("task_id", "")
             task = supervisor.state.tasks.get(task_id)

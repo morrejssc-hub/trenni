@@ -32,6 +32,7 @@ class SpawnedJob:
     condition: Condition | None = None
     job_context: JobContextConfig = field(default_factory=JobContextConfig)
     parent_job_id: str = ""
+    team: str = "default"
 
 
 @dataclass
@@ -44,6 +45,7 @@ class SpawnDefaults:
     workspace_overrides: dict[str, Any] = field(default_factory=dict)
     publication_overrides: dict[str, Any] = field(default_factory=dict)
     task_id: str = ""
+    team: str = "default"
 
 
 @dataclass
@@ -55,6 +57,7 @@ class TaskRecord:
     terminal_state: str = ""
     source_event_id: str = ""
     spec: dict = field(default_factory=dict)
+    team: str = "default"
     eval_spec: EvalSpec | None = None
     eval_spawned: bool = False
     eval_job_id: str = ""

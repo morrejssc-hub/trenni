@@ -28,7 +28,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PASLOE_PORT=18900
 PASLOE_HOST=127.0.0.1
 WORK_DIR="${PROJECT_DIR}/smoke-work"
-TASK="List the files in the evo repository and describe what each role does. Then call task_complete with status success."
+TASK="List the files in the evo repository and describe what each role does. Then stop calling tools and summarize the result."
 JOB_IMAGE="localhost/yoitsu-palimpsest-job:dev"
 PODMAN_SOCKET_URI="${PODMAN_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock}"
 

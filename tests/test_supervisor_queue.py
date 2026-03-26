@@ -70,6 +70,19 @@ async def test_handle_trigger_enqueues():
 
 
 @pytest.mark.asyncio
+async def test_handle_trigger_with_team_defaults_to_planner_role():
+    sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
+    event = _evt("evt-team", "trigger.external", {"goal": "plan X", "team": "backend", "context": {}})
+
+    await sup._handle_trigger(event)
+
+    job = sup._ready_queue.get_nowait()
+    assert job.role == "planner"
+    assert job.team == "backend"
+
+
+@pytest.mark.asyncio
 async def test_handle_trigger_deduplicates():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
@@ -192,9 +205,27 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields
     assert child.repo == "/parent-repo"
     assert child.init_branch == "parent-branch"
     assert child.evo_sha == "parent-sha"
+    assert child.team == "default"
     assert child.workspace_overrides["depth"] == 3
     assert child.llm_overrides["model"] == "kimi-parent"
     assert child.publication_overrides["branch_prefix"] == "parent/job"
+
+
+def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
+    sup = _make_supervisor()
+    task = TaskRecord(task_id="t-1", goal="goal", team="backend")
+    task.job_order = ["j1"]
+    sup.state.tasks["t-1"] = task
+    sup.state.jobs_by_id["j1"] = SpawnedJob("j1", "e1", "goal", "implementer", "/repo", "main", None, task_id="t-1")
+    sup.state.job_git_refs["j1"] = "palimpsest/job/j1:deadbeef"
+
+    job = sup._build_eval_job(task, "t-1-eval")
+
+    assert job.role == "evaluator"
+    assert job.team == "backend"
+    assert job.init_branch == "palimpsest/job/j1"
+    assert job.workspace_overrides["new_branch"] is False
+    assert job.publication_overrides["strategy"] == "skip"
 
 
 @pytest.mark.asyncio

@@ -240,6 +240,7 @@ class Supervisor:
             task_id=job.task_id or job.job_id,
             task=job.task,
             role=job.role,
+            team=job.team,
             repo=job.repo,
             init_branch=job.init_branch,
             evo_sha=job.evo_sha,
@@ -310,19 +311,23 @@ class Supervisor:
 
         task_id = self._root_task_id(event.id)
         root_job_id = f"{task_id}-root"
+        team = str(data.team or data.context.get("team") or "default").strip() or "default"
 
         self.scheduler.record_task_submission(
             task_id=task_id,
             goal=data.goal,
             source_event_id=event.id,
-            spec=data.context,
+            spec={**data.context, "team": team},
         )
+        if task_id in self.state.tasks:
+            self.state.tasks[task_id].team = team
 
         if not replay:
             await self.client.emit(
                 "task.created",
                 TaskCreatedData(
                     task_id=task_id,
+                    team=team,
                     goal=data.goal,
                     source_trigger_id=event.id,
                 ).model_dump(mode="json"),
@@ -334,7 +339,7 @@ class Supervisor:
             )
 
         # Context might define execution details, otherwise use defaults
-        role = data.context.get("role", "default")
+        role = data.context.get("role") or data.context.get("planner_role") or "planner"
         repo = data.context.get("repo", "")
         init_branch = data.context.get("init_branch", "main")
         evo_sha = data.context.get("evo_sha")
@@ -352,6 +357,7 @@ class Supervisor:
                 workspace_overrides=dict(data.context.get("workspace", {})),
                 publication_overrides=dict(data.context.get("publication", {})),
                 task_id=task_id,
+                team=team,
             ),
             replay=replay,
         )
@@ -374,6 +380,7 @@ class Supervisor:
                     TaskCreatedData(
                         task_id=task.task_id,
                         parent_task_id=parent_id,
+                        team=task.team,
                         goal=task.goal,
                         source_trigger_id=task.source_event_id,
                         eval_spec=task.eval_spec,
@@ -411,6 +418,7 @@ class Supervisor:
                     source_event_id=job.source_event_id,
                     task=job.task,
                     role=job.role,
+                    team=job.team,
                     repo=job.repo,
                     init_branch=job.init_branch,
                     evo_sha=job.evo_sha or "",
@@ -445,6 +453,7 @@ class Supervisor:
             source_event_id=data.source_event_id,
             task=data.task,
             role=data.role,
+            team=data.team,
             repo=data.repo,
             init_branch=data.init_branch,
             evo_sha=data.evo_sha or None,
@@ -857,6 +866,7 @@ class Supervisor:
         job_context=None,
         parent_job_id: str = "",
         condition=None,
+        team: str = "default",
     ) -> None:
         spec = self.runtime_builder.build(
             job_id=job_id,
@@ -864,6 +874,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            team=team,
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha,
@@ -885,6 +896,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            team=team,
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha,
@@ -900,6 +912,7 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             role=role,
+            team=team,
             evo_sha=evo_sha,
             llm_overrides=dict(llm_overrides or {}),
             workspace_overrides=dict(workspace_overrides or {}),
@@ -913,6 +926,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=task,
             role=role,
+            team=team,
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha or "",
@@ -1017,6 +1031,7 @@ class Supervisor:
             source_event_id=source_event_id,
             task=data.get("task", ""),
             role=data.get("role", "default"),
+            team=data.get("team", "default"),
             repo=data.get("repo", ""),
             init_branch=data.get("init_branch", "main"),
             evo_sha=data.get("evo_sha") or None,
@@ -1036,6 +1051,7 @@ class Supervisor:
             workspace_overrides=dict(data.get("workspace") or {}),
             publication_overrides=dict(data.get("publication") or {}),
             task_id=data.get("task_id", "") or job_id,
+            team=data.get("team", "default"),
         )
         if source_event_id:
             self._launched_event_ids.add(source_event_id)
@@ -1068,7 +1084,7 @@ class Supervisor:
 
     def _build_eval_job(self, task: TaskRecord, eval_job_id: str) -> SpawnedJob:
         eval_spec = task.eval_spec or EvalSpec()
-        role = eval_spec.role or "default"
+        role = eval_spec.role or "evaluator"
         base_job = next(
             (
                 self.state.jobs_by_id[job_id]
@@ -1077,18 +1093,28 @@ class Supervisor:
             ),
             None,
         )
+        latest_git_ref = next(
+            (
+                self.state.job_git_refs.get(job_id, "")
+                for job_id in reversed(task.job_order)
+                if self.state.job_git_refs.get(job_id, "")
+            ),
+            "",
+        )
+        eval_branch = self._branch_from_git_ref(latest_git_ref) or (base_job.init_branch if base_job else "main")
         child_task_ids = self._direct_child_task_ids(task.task_id)
         return SpawnedJob(
             job_id=eval_job_id,
             source_event_id=task.source_event_id,
             task=self._eval_prompt(task.goal, eval_spec),
             role=role,
+            team=task.team,
             repo=base_job.repo if base_job else "",
-            init_branch=base_job.init_branch if base_job else "main",
+            init_branch=eval_branch,
             evo_sha=base_job.evo_sha if base_job else None,
             llm_overrides={},
-            workspace_overrides={},
-            publication_overrides={},
+            workspace_overrides={"new_branch": False},
+            publication_overrides={"strategy": "skip"},
             task_id=task.task_id,
             parent_job_id=base_job.parent_job_id if base_job else "",
             job_context=JobContextConfig(
@@ -1120,13 +1146,19 @@ class Supervisor:
         return (
             "You are the evaluator for task semantic quality.\n"
             "Assess whether the task goal is truly met using the provided context.\n"
-            "Return a single JSON object in task_complete(summary=...) with fields:\n"
+            "Return a single JSON object in your final response with fields:\n"
             '{"verdict":"pass|fail|unknown","summary":"...","criteria_results":[{"criterion":"...","result":"pass|fail|unknown","evidence":"..."}]}\n'
             "Do not perform rework and do not mutate workflow state.\n\n"
             f"Original goal:\n{goal}\n\n"
             f"Expected deliverables:\n{deliverables}\n\n"
             f"Verification criteria:\n{criteria}\n"
         )
+
+    @staticmethod
+    def _branch_from_git_ref(git_ref: str) -> str:
+        if ":" not in git_ref:
+            return ""
+        return git_ref.split(":", 1)[0].strip()
 
     @staticmethod
     def _event_idempotency_key(*, source_event_id: str, event_type: str, entity_id: str) -> str | None:
