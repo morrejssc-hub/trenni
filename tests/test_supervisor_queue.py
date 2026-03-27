@@ -59,7 +59,7 @@ async def test_handle_trigger_enqueues():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
     event = _evt("evt-abc", "trigger.external.received",
-                 {"goal": "do X", "context": {"role": "default", "repo": "/r", "init_branch": "main"}})
+                 {"goal": "do X", "budget": 0.5, "context": {"role": "default", "repo": "/r", "init_branch": "main"}})
 
     await sup._handle_trigger(event)
 
@@ -74,6 +74,7 @@ async def test_handle_trigger_enqueues():
 async def test_handle_trigger_with_team_defaults_to_planner_role():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
+    sup._validate_spawned_job_budget = MagicMock(return_value=None)
     sup._resolve_team_definition = MagicMock(
         return_value=SimpleNamespace(
             name="backend",
@@ -89,6 +90,56 @@ async def test_handle_trigger_with_team_defaults_to_planner_role():
     job = sup._ready_queue.get_nowait()
     assert job.role == "custom-planner"
     assert job.team == "backend"
+
+
+@pytest.mark.asyncio
+async def test_handle_trigger_rejects_budget_below_role_min_cost():
+    sup = _make_supervisor()
+    emitted = []
+
+    async def fake_emit(type_, data, **kwargs):
+        emitted.append((type_, data))
+        return "evt-id"
+
+    sup.client.emit = fake_emit
+    sup._resolve_team_definition = MagicMock(
+        return_value=SimpleNamespace(
+            name="backend",
+            planner_role="planner",
+            eval_role="evaluator",
+            roles=["implementer"],
+        )
+    )
+    sup._resolve_role_metadata = MagicMock(return_value={"min_cost": 0.5})
+    event = _evt(
+        "evt-budget",
+        "trigger.external.received",
+        {"goal": "plan X", "team": "backend", "budget": 0.1, "context": {}},
+    )
+
+    await sup._handle_trigger(event)
+
+    assert sup._ready_queue.qsize() == 0
+    assert any(type_ == "supervisor.task.failed" for type_, _ in emitted)
+    assert sup.state.tasks[sup._root_task_id("evt-budget")].terminal_state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_handle_trigger_budget_propagates_to_root_job():
+    sup = _make_supervisor()
+    sup.client.emit = AsyncMock()
+    sup._validate_spawned_job_budget = MagicMock(return_value=None)
+    event = _evt(
+        "evt-root-budget",
+        "trigger.external.received",
+        {"goal": "do X", "budget": 0.75, "context": {"role": "default", "repo": "/r", "init_branch": "main"}},
+    )
+
+    await sup._handle_trigger(event)
+
+    job = sup._ready_queue.get_nowait()
+    assert job.role_params["budget"] == 0.75
+    assert job.llm_overrides["max_total_cost"] == 0.75
 
 
 @pytest.mark.asyncio
@@ -118,6 +169,7 @@ async def test_handle_trigger_ignores_empty_goal():
 async def test_handle_spawn_creates_children_no_continuation():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
+    sup._validate_spawned_job_budget = MagicMock(return_value=None)
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="main",
@@ -128,8 +180,8 @@ async def test_handle_spawn_creates_children_no_continuation():
     event = _evt("spawn-1", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
-            {"prompt": "child A", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
-            {"prompt": "child B", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
+            {"goal": "child A", "role": "worker", "params": {"repo": "/r", "branch": "main"}},
+            {"goal": "child B", "role": "worker", "params": {"repo": "/r", "branch": "main"}},
         ],
         "wait_for": "all_complete",
     })
@@ -149,6 +201,24 @@ async def test_handle_spawn_creates_children_no_continuation():
 
 
 @pytest.mark.asyncio
+async def test_supervisor_start_validates_role_catalog_before_loop():
+    sup = _make_supervisor()
+    sup.backend.ensure_ready = AsyncMock()
+    sup.client.register_source = AsyncMock()
+    sup._validate_role_catalog = MagicMock(side_effect=ValueError("broken team"))
+    sup._replay_unfinished_tasks = AsyncMock()
+    sup._try_register_webhook = AsyncMock()
+    sup._run_loop = AsyncMock()
+    sup.client.close = AsyncMock()
+    sup.backend.close = AsyncMock()
+
+    with pytest.raises(ValueError, match="broken team"):
+        await sup.start()
+
+    sup._run_loop.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_handle_spawn_empty_tasks_ignored():
     sup = _make_supervisor()
     event = _evt("spawn-empty", "agent.job.spawn_request", {
@@ -164,6 +234,7 @@ async def test_handle_spawn_empty_tasks_ignored():
 async def test_handle_event_deduplicates_spawn_request():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
+    sup._validate_spawned_job_budget = MagicMock(return_value=None)
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="main",
@@ -174,8 +245,8 @@ async def test_handle_event_deduplicates_spawn_request():
     event = _evt("spawn-dup", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
-            {"prompt": "child A", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
-            {"prompt": "child B", "job_spec": {"role": "worker", "repo": "/r", "init_branch": "main"}},
+            {"goal": "child A", "role": "worker", "params": {"repo": "/r", "branch": "main"}},
+            {"goal": "child B", "role": "worker", "params": {"repo": "/r", "branch": "main"}},
         ],
     })
 
@@ -186,9 +257,10 @@ async def test_handle_event_deduplicates_spawn_request():
 
 
 @pytest.mark.asyncio
-async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields():
+async def test_handle_spawn_inherits_parent_defaults_for_missing_params_fields():
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
+    sup._validate_spawned_job_budget = MagicMock(return_value=None)
     sup._spawn_defaults_by_job["parent-1"] = SpawnDefaults(
         repo="/parent-repo",
         init_branch="parent-branch",
@@ -202,7 +274,7 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields
     event = _evt("spawn-inherit", "agent.job.spawn_request", {
         "job_id": "parent-1",
         "tasks": [
-            {"prompt": "child task", "job_spec": {"role": "worker", "workspace": {"depth": 3}}},
+            {"goal": "child task", "role": "worker"},
         ],
     })
 
@@ -215,7 +287,6 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_job_spec_fields
     assert child.init_branch == "parent-branch"
     assert child.evo_sha == "parent-sha"
     assert child.team == "default"
-    assert child.workspace_overrides["depth"] == 3
     assert child.llm_overrides["model"] == "kimi-parent"
     assert child.publication_overrides["branch_prefix"] == "parent/job"
 
@@ -246,6 +317,109 @@ def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
 
 
 @pytest.mark.asyncio
+async def test_team_trigger_spawn_and_eval_flow():
+    sup = _make_supervisor()
+
+    emitted = []
+
+    async def fake_emit(type_, data, **kwargs):
+        emitted.append((type_, data))
+        return "evt-id"
+
+    sup.client.emit = fake_emit
+    sup._resolve_team_definition = MagicMock(
+        return_value=SimpleNamespace(
+            name="backend",
+            planner_role="planner",
+            eval_role="evaluator",
+            worker_roles=["implementer"],
+            roles=["planner", "implementer", "evaluator"],
+        )
+    )
+
+    trigger = _evt(
+        "evt-root",
+        "trigger.external.received",
+        {
+            "team": "backend",
+            "goal": "Plan backend refactor",
+            "budget": 1.0,
+            "context": {"repo": "/repo", "init_branch": "main"},
+        },
+    )
+    await sup._handle_trigger(trigger)
+
+    planner_job = sup._ready_queue.get_nowait()
+    assert planner_job.role == "planner"
+    sup.state.jobs_by_id[planner_job.job_id] = planner_job
+
+    spawn_evt = _evt(
+        "evt-spawn",
+        "agent.job.spawn_request",
+        {
+            "job_id": planner_job.job_id,
+            "task_id": planner_job.task_id,
+            "tasks": [
+                {
+                    "goal": "Implement backend refactor",
+                    "role": "implementer",
+                    "budget": 0.6,
+                    "params": {"repo": "/repo", "branch": "main"},
+                    "eval_spec": {
+                        "deliverables": ["refactor complete"],
+                        "criteria": ["tests pass"],
+                    },
+                }
+            ],
+        },
+    )
+    await sup._handle_spawn(spawn_evt)
+
+    child_task_ids = [task_id for task_id in sup.state.tasks if "/" in task_id]
+    assert len(child_task_ids) == 1
+    child_task_id = child_task_ids[0]
+    child_job = next(job for job in sup.state.ready_queue_snapshot() if job.task_id == child_task_id)
+    assert child_job.role == "implementer"
+    assert child_job.role_params["goal"] == "Implement backend refactor"
+    assert child_job.llm_overrides["max_total_cost"] == 0.6
+
+    sup.state.jobs_by_id[child_job.job_id] = child_job
+    sup.state.drop_from_ready_queue(child_job.job_id)
+    await sup._handle_job_done(
+        _evt(
+            "evt-child-done",
+            "agent.job.completed",
+            {
+                "job_id": child_job.job_id,
+                "task_id": child_task_id,
+                "summary": "implemented",
+                "git_ref": "palimpsest/job/demo:deadbeef",
+            },
+        )
+    )
+
+    assert any(t == "supervisor.task.evaluating" for t, _ in emitted)
+    eval_job = next(job for job in sup.state.ready_queue_snapshot() if job.task_id == child_task_id and job.job_context.eval is not None)
+    assert eval_job.role == "evaluator"
+
+    sup.state.jobs_by_id[eval_job.job_id] = eval_job
+    await sup._handle_job_done(
+        _evt(
+            "evt-eval-done",
+            "agent.job.completed",
+            {
+                "job_id": eval_job.job_id,
+                "task_id": child_task_id,
+                "summary": '{"verdict":"pass","summary":"looks good","criteria_results":[]}',
+            },
+        )
+    )
+
+    terminal_events = [t for t, d in emitted if d.get("task_id") == child_task_id]
+    assert "supervisor.task.completed" in terminal_events
+
+
+@pytest.mark.asyncio
 async def test_handle_event_realtime_advances_cursor_and_delays_poll():
     sup = _make_supervisor()
     sup._webhook_active = True
@@ -265,7 +439,7 @@ async def test_handle_event_marks_processed_only_after_success():
     event = _evt(
         "evt-retry",
         "trigger.external.received",
-        {"goal": "do X", "context": {"role": "default"}},
+        {"goal": "do X", "budget": 0.5, "context": {"role": "default"}},
     )
 
     original = sup._handle_trigger

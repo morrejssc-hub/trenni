@@ -49,28 +49,21 @@ class SpawnHandler:
             token = self._id_hash(f"{parent_task_id}:{event.id}:{index}")
             task_id = f"{parent_task_id}/{token}"
             job_id = f"{parent_job_id}-c{token}"
-            spec = child.job_spec
-
-            role = child.role or spec.role or self._inherit("role", parent_job, parent_defaults, "default")
+            role = child.role or self._inherit("role", parent_job, parent_defaults, "default")
             role_params = dict(child.params or {})
             role_params.setdefault("goal", prompt)
             if child.budget:
                 role_params.setdefault("budget", float(child.budget))
-            repo = spec.repo or self._inherit("repo", parent_job, parent_defaults, "")
-            init_branch = spec.init_branch or self._inherit("init_branch", parent_job, parent_defaults, "main")
-            evo_sha = child.sha or spec.evo_sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
+            repo = str(role_params.get("repo") or self._inherit("repo", parent_job, parent_defaults, ""))
+            init_branch = str(role_params.get("branch") or role_params.get("init_branch") or self._inherit("init_branch", parent_job, parent_defaults, "main"))
+            evo_sha = child.sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
 
             llm = dict(self._inherit("llm_overrides", parent_job, parent_defaults, {}))
-            llm.update(dict(spec.llm))
-            if child.budget and "max_total_cost" not in llm:
+            if child.budget:
                 llm["max_total_cost"] = float(child.budget)
-                llm.setdefault("max_iterations", 0)
 
             workspace = dict(self._inherit("workspace_overrides", parent_job, parent_defaults, {}))
-            workspace.update(dict(spec.workspace))
-
             publication = dict(self._inherit("publication_overrides", parent_job, parent_defaults, {}))
-            publication.update(dict(spec.publication))
             team = self._inherit("team", parent_job, parent_defaults, "default")
 
             child_defs.append(

@@ -101,6 +101,7 @@ class Supervisor:
         self._webhook_id: str | None = None
         self._webhook_active = False
         self._webhook_poll_not_before: float = 0.0
+        self._role_catalog_cache: dict[str, dict[str, Any]] | None = None
 
     @property
     def event_cursor(self) -> str | None:
@@ -125,6 +126,7 @@ class Supervisor:
         try:
             await self.backend.ensure_ready()
             await self.client.register_source()
+            self._validate_role_catalog()
             await self._replay_unfinished_tasks()
             await self._try_register_webhook()
 
@@ -327,7 +329,7 @@ class Supervisor:
             task_id=task_id,
             goal=data.goal,
             source_event_id=event.id,
-            spec={**data.context, "team": team},
+            spec={**data.context, "team": team, "budget": data.budget},
         )
         if task_id in self.state.tasks:
             self.state.tasks[task_id].team = team
@@ -353,30 +355,42 @@ class Supervisor:
         role = data.context.get("role") or data.context.get("planner_role") or team_def.planner_role or "planner"
         role_params = dict(data.context.get("params", {}))
         role_params.setdefault("goal", data.goal)
-        if "budget" in data.context:
-            role_params.setdefault("budget", data.context["budget"])
+        if data.budget:
+            role_params.setdefault("budget", data.budget)
         repo = data.context.get("repo", "")
         init_branch = data.context.get("init_branch", "main")
         evo_sha = data.context.get("evo_sha")
+        llm_overrides = dict(data.context.get("llm", {}))
+        if data.budget and "max_total_cost" not in llm_overrides:
+            llm_overrides["max_total_cost"] = float(data.budget)
 
-        cancelled = await self._enqueue(
-            SpawnedJob(
-                job_id=root_job_id,
-                source_event_id=event.id,
-                task=data.goal,
-                role=role,
-                role_params=role_params,
-                repo=repo,
-                init_branch=init_branch,
-                evo_sha=evo_sha,
-                llm_overrides=dict(data.context.get("llm", {})),
-                workspace_overrides=dict(data.context.get("workspace", {})),
-                publication_overrides=dict(data.context.get("publication", {})),
-                task_id=task_id,
-                team=team,
-            ),
-            replay=replay,
+        root_job = SpawnedJob(
+            job_id=root_job_id,
+            source_event_id=event.id,
+            task=data.goal,
+            role=role,
+            role_params=role_params,
+            repo=repo,
+            init_branch=init_branch,
+            evo_sha=evo_sha,
+            llm_overrides=llm_overrides,
+            workspace_overrides=dict(data.context.get("workspace", {})),
+            publication_overrides=dict(data.context.get("publication", {})),
+            task_id=task_id,
+            team=team,
         )
+        budget_error = self._validate_spawned_job_budget(root_job)
+        if budget_error:
+            if not replay:
+                await self._emit_task_terminal(
+                    task_id=task_id,
+                    state="failed",
+                    result=TaskResult(),
+                    reason=budget_error,
+                )
+            return
+
+        cancelled = await self._enqueue(root_job, replay=replay)
         if cancelled and not replay:
             await self._emit_cancellations(cancelled, reason="Initial condition is impossible")
         self._launched_event_ids.add(event.id)
@@ -410,6 +424,16 @@ class Supervisor:
 
         cancelled: list[SpawnedJob] = []
         for job in plan.jobs:
+            budget_error = self._validate_spawned_job_budget(job)
+            if budget_error:
+                if not replay:
+                    await self._emit_task_terminal(
+                        task_id=job.task_id or job.job_id,
+                        state="failed",
+                        result=TaskResult(),
+                        reason=budget_error,
+                    )
+                continue
             cancelled.extend(await self._enqueue(job, replay=replay))
 
         if cancelled and not replay:
@@ -1045,10 +1069,12 @@ class Supervisor:
             return Path(self.config.evo_root)
         return Path(__file__).resolve().parents[2] / "palimpsest" / "evo"
 
-    def _resolve_team_definition(self, name: str):
-        team_name = (name or "default").strip() or "default"
+    def _load_role_catalog(self) -> dict[str, dict[str, Any]]:
+        if self._role_catalog_cache is not None:
+            return self._role_catalog_cache
+
         roles_dir = self._team_root() / "roles"
-        members: list[dict[str, Any]] = []
+        catalog: dict[str, dict[str, Any]] = {}
         if roles_dir.exists():
             for py_path in sorted(roles_dir.glob("*.py")):
                 if py_path.name.startswith("_"):
@@ -1064,16 +1090,65 @@ class Supervisor:
                         if not isinstance(func, ast.Name) or func.id != "role":
                             continue
                         keywords = {kw.arg: ast.literal_eval(kw.value) for kw in deco.keywords if kw.arg is not None}
-                        teams = list(keywords.get("teams", ["default"]))
-                        if team_name not in teams:
-                            continue
-                        members.append(
-                            {
-                                "name": keywords.get("name", node.name),
-                                "description": keywords.get("description", ""),
-                                "role_type": keywords.get("role_type", "worker"),
-                            }
-                        )
+                        role_name = str(keywords.get("name", node.name))
+                        catalog[role_name] = {
+                            "name": role_name,
+                            "description": keywords.get("description", ""),
+                            "role_type": keywords.get("role_type", "worker"),
+                            "teams": list(keywords.get("teams", ["default"])),
+                            "min_cost": float(keywords.get("min_cost", 0.0) or 0.0),
+                            "recommended_cost": float(keywords.get("recommended_cost", 0.0) or 0.0),
+                            "min_capability": str(keywords.get("min_capability", "") or ""),
+                        }
+                        break
+        self._role_catalog_cache = catalog
+        return catalog
+
+    def _validate_role_catalog(self) -> None:
+        catalog = self._load_role_catalog()
+        team_names = sorted({team for meta in catalog.values() for team in meta.get("teams", [])})
+        if "default" not in team_names:
+            team_names.insert(0, "default")
+        for team_name in team_names:
+            self._resolve_team_definition(team_name)
+
+    def _resolve_role_metadata(self, role_name: str) -> dict[str, Any]:
+        catalog = self._load_role_catalog()
+        if role_name not in catalog:
+            raise FileNotFoundError(f"Role definition not found: {role_name!r}")
+        return catalog[role_name]
+
+    def _allocated_job_budget(self, job: SpawnedJob) -> float:
+        if isinstance(job.role_params.get("budget"), (int, float)):
+            return float(job.role_params["budget"])
+        if isinstance(job.llm_overrides.get("max_total_cost"), (int, float)):
+            return float(job.llm_overrides["max_total_cost"])
+        default_budget = self.config.default_llm.get("max_total_cost")
+        if isinstance(default_budget, (int, float)):
+            return float(default_budget)
+        return 0.0
+
+    def _validate_spawned_job_budget(self, job: SpawnedJob) -> str | None:
+        try:
+            meta = self._resolve_role_metadata(job.role)
+        except FileNotFoundError as exc:
+            return str(exc)
+        min_cost = float(meta.get("min_cost", 0.0) or 0.0)
+        allocated = self._allocated_job_budget(job)
+        if min_cost > 0 and allocated < min_cost:
+            return (
+                f"Allocated budget ${allocated:.4f} is below role {job.role!r} "
+                f"minimum cost ${min_cost:.4f}"
+            )
+        return None
+
+    def _resolve_team_definition(self, name: str):
+        team_name = (name or "default").strip() or "default"
+        members = [
+            meta
+            for meta in self._load_role_catalog().values()
+            if team_name in meta.get("teams", ["default"])
+        ]
         if not members:
             if team_name == "default":
                 return _DEFAULT_TEAM_DEFINITION

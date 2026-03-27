@@ -73,6 +73,7 @@ class RuntimeSpecBuilder:
                 "job_id": job_id,
                 "task_id": task_id or job_id,
                 "task": task,
+                "evo_sha": evo_sha or "",
                 "role": role,
                 "role_params": dict(role_params or {}),
                 "team": team,
