@@ -28,7 +28,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PASLOE_PORT=18900
 PASLOE_HOST=127.0.0.1
 WORK_DIR="${PROJECT_DIR}/smoke-work"
-TASK="List the files in the evo repository and describe what each role does. Then stop calling tools and summarize the result."
+TASK="Create a new file smoke/SMOKE.txt in this repository. The file must contain exactly one line with no trailing whitespace: smoke: ok. Do not modify any other file. Commit the change."
 JOB_IMAGE="localhost/yoitsu-palimpsest-job:dev"
 PODMAN_SOCKET_URI="${PODMAN_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock}"
 
@@ -40,10 +40,14 @@ MODEL="claude-sonnet-4-6"
 
 # 工作区配置
 WORK_REPO=""
-WORK_BRANCH="main"
+WORK_BRANCH="master"
 
-# 超时
-JOB_TIMEOUT=120   # 等待 job 完成的最大秒数
+# 任务路由
+TEAM="default"
+BUDGET="0.80"
+
+# 超时（planner + child + eval 三个 job，给足时间）
+JOB_TIMEOUT=600
 
 # ── 参数解析 ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -55,6 +59,8 @@ while [[ $# -gt 0 ]]; do
         --repo)        WORK_REPO="$2";   shift 2;;
         --branch)      WORK_BRANCH="$2"; shift 2;;
         --task)        TASK="$2";        shift 2;;
+        --team)        TEAM="$2";        shift 2;;
+        --budget)      BUDGET="$2";      shift 2;;
         --timeout)     JOB_TIMEOUT="$2"; shift 2;;
         --port)        PASLOE_PORT="$2"; shift 2;;
         -h|--help)
@@ -67,8 +73,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --model MODEL        LLM model name (default: claude-sonnet-4-6)"
             echo "  --repo URL           Git repo URL to work on (optional)"
             echo "  --branch BRANCH      Git branch (default: main)"
-            echo "  --task TEXT          Task to submit"
-            echo "  --timeout SECS       Max seconds to wait for job (default: 120)"
+            echo "  --task TEXT          Task goal to submit"
+            echo "  --team NAME          Team to route to (default: default)"
+            echo "  --budget FLOAT       Root budget in USD (default: 0.80)"
+            echo "  --timeout SECS       Max seconds to wait for full chain (default: 600)"
             echo "  --port PORT          Pasloe port (default: 18900)"
             exit 0;;
         *) fail "Unknown option: $1"; exit 1;;
@@ -197,17 +205,25 @@ fi
 ok "Trenni 已启动 (PID=$TRENNI_PID)"
 
 # ── 提交测试任务 ──────────────────────────────────────────────────────
-info "提交测试任务..."
-TASK_DATA=$(python3 -c "import json; print(json.dumps({
+info "提交 smoke 任务 (team=$TEAM, budget=$BUDGET)..."
+TASK_DATA=$(python3 -c "
+import json
+payload = {
     'source_id': 'smoke-test',
-    'type': 'task.submit',
+    'type': 'trigger.external.received',
     'data': {
-        'task': '''$TASK''',
-        'role': 'default',
-        'repo': '''$WORK_REPO''',
-        'branch': '''$WORK_BRANCH'''
-    }
-}))")
+        'goal': '''$TASK''',
+        'team': '$TEAM',
+        'budget': float('$BUDGET'),
+        'context': {
+            'repo': '$WORK_REPO',
+            'init_branch': '$WORK_BRANCH',
+            'new_branch': True,
+        },
+    },
+}
+print(json.dumps(payload))
+")
 SUBMIT_RESP=$(curl -sf -X POST "${PASLOE_URL}/events" \
     -H "Content-Type: application/json" \
     -d "$TASK_DATA")
@@ -215,103 +231,142 @@ SUBMIT_RESP=$(curl -sf -X POST "${PASLOE_URL}/events" \
 EVENT_ID=$(echo "$SUBMIT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 ok "任务已提交 (event_id=$EVENT_ID)"
 
-# ── 等待 job 被 launch ───────────────────────────────────────────────
-info "等待 supervisor 拾取任务..."
-JOB_ID=""
+# ── 等待 planner job 被 launch ──────────────────────────────────────
+info "等待 supervisor 拾取任务（planner job）..."
+PLANNER_JOB_ID=""
 for i in $(seq 1 20); do
-    EVENTS=$(curl -sf "${PASLOE_URL}/events?order=asc" 2>/dev/null || echo "[]")
-    JOB_ID=$(echo "$EVENTS" | python3 -c "
+    EVENTS=$(curl -sf "${PASLOE_URL}/events?order=asc&limit=200" 2>/dev/null || echo "[]")
+    PLANNER_JOB_ID=$(echo "$EVENTS" | python3 -c "
 import sys, json
 events = json.load(sys.stdin)
 for e in events:
-    if e['type'] == 'supervisor.job.launched':
+    if e['type'] == 'supervisor.job.launched' and e['data'].get('role') not in ('evaluator', 'eval'):
         print(e['data']['job_id'])
         break
 " 2>/dev/null || true)
-    [[ -n "$JOB_ID" ]] && break
+    [[ -n "$PLANNER_JOB_ID" ]] && break
     sleep 1
 done
 
-if [[ -z "$JOB_ID" ]]; then
-    fail "Supervisor 未启动 job，查看日志: $WORK_DIR/trenni.log"
+if [[ -z "$PLANNER_JOB_ID" ]]; then
+    fail "Supervisor 未启动 planner job，查看日志: $WORK_DIR/trenni.log"
     tail -20 "$WORK_DIR/trenni.log"
     exit 1
 fi
-ok "Job 已启动: $JOB_ID"
+ok "Planner job 已启动: $PLANNER_JOB_ID"
 
-# ── 等待 job 完成 ────────────────────────────────────────────────────
-info "等待 job 完成 (超时: ${JOB_TIMEOUT}s)..."
+# ── 等待完整链路完成 ─────────────────────────────────────────────────
+# 成功判据（按顺序）:
+#   1. planner job 终态
+#   2. supervisor.task.evaluating （证明 spawn + child 跑完）
+#   3. 任意 child task 进入终态
+info "等待完整链路 (超时: ${JOB_TIMEOUT}s)..."
+info "判据: planner终态 → task.evaluating → child task终态"
 ELAPSED=0
-FINAL_STATUS=""
+SAW_PLANNER_DONE=0
+SAW_EVALUATING=0
+CHILD_TASK_TERMINAL=""
 
 while [[ $ELAPSED -lt $JOB_TIMEOUT ]]; do
-    # 检查 trenni 是否还活着
     if ! kill -0 "$TRENNI_PID" 2>/dev/null; then
         warn "Trenni 进程已退出"
         break
     fi
 
-# 查询 eventstore 看是否有终态事件
-    EVENTS=$(curl -sf "${PASLOE_URL}/events?order=asc" 2>/dev/null || echo "[]")
-    FINAL_STATUS=$(echo "$EVENTS" | python3 -c "
+    EVENTS=$(curl -sf "${PASLOE_URL}/events?order=asc&limit=500" 2>/dev/null || echo "[]")
+
+    CHAIN=$(echo "$EVENTS" | python3 -c "
 import sys, json
 events = json.load(sys.stdin)
-for e in events:
-    if e['type'] in ('agent.job.completed', 'agent.job.failed') and e['data'].get('job_id') == '$JOB_ID':
-        print(e['type'])
-        break
-" 2>/dev/null || true)
-    [[ -n "$FINAL_STATUS" ]] && break
+planner_job_id = '$PLANNER_JOB_ID'
 
-    sleep 3
-    ELAPSED=$((ELAPSED + 3))
-    # 每 15 秒输出一次进度
-    if (( ELAPSED % 15 == 0 )); then
-        info "已等待 ${ELAPSED}s..."
+planner_done = 0
+evaluating = 0
+child_terminal = ''
+
+for e in events:
+    t = e['type']
+    d = e.get('data', {})
+    if t in ('agent.job.completed', 'agent.job.failed') and d.get('job_id') == planner_job_id:
+        planner_done = 1
+    if t == 'supervisor.task.evaluating':
+        evaluating = 1
+    if t in ('supervisor.task.completed', 'supervisor.task.partial',
+             'supervisor.task.failed', 'supervisor.task.cancelled') and evaluating:
+        child_terminal = t
+
+print(f'{planner_done},{evaluating},{child_terminal}')
+" 2>/dev/null || echo "0,0,")
+
+    SAW_PLANNER_DONE=$(echo "$CHAIN" | cut -d, -f1)
+    SAW_EVALUATING=$(echo "$CHAIN"  | cut -d, -f2)
+    CHILD_TASK_TERMINAL=$(echo "$CHAIN" | cut -d, -f3)
+
+    [[ -n "$CHILD_TASK_TERMINAL" ]] && break
+
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if (( ELAPSED % 30 == 0 )); then
+        MILESTONE=""
+        [[ "$SAW_PLANNER_DONE" == "1" ]] && MILESTONE="${MILESTONE}planner✓ "
+        [[ "$SAW_EVALUATING"   == "1" ]] && MILESTONE="${MILESTONE}evaluating✓ "
+        info "已等待 ${ELAPSED}s  ${MILESTONE}..."
     fi
 done
 
 # ── 结果汇报 ──────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
-info "测试结果汇报"
+info "Smoke 链路汇报"
 echo "════════════════════════════════════════════════════════════"
 
-# 显示所有事件
 info "Pasloe 事件流:"
-curl -sf "${PASLOE_URL}/events?order=asc" | python3 -c "
+curl -sf "${PASLOE_URL}/events?order=asc&limit=500" | python3 -c "
 import sys, json
 events = json.load(sys.stdin)
 for e in events:
     src = e.get('source_id', '?')
     typ = e['type']
-    job = e.get('data', {}).get('job_id', '')
+    d   = e.get('data', {})
+    job = d.get('job_id', '')
+    task = d.get('task_id', '')
     extra = ''
     if typ == 'supervisor.job.launched':
-        extra = f' container_id={e[\"data\"].get(\"container_id\",\"?\")} role={e[\"data\"].get(\"role\",\"?\")}'
-    elif typ in ('agent.job.completed', 'agent.job.failed'):
-        extra = f' summary={e[\"data\"].get(\"summary\",\"(none)\")[:80]}'
+        extra = f' role={d.get(\"role\",\"?\")} task={task}'
+    elif typ in ('agent.job.completed', 'agent.job.failed', 'agent.job.started'):
+        extra = f' {d.get(\"summary\",\"\")[:60]}'
+    elif typ == 'agent.job.spawn_request':
+        n = len(d.get('tasks', []))
+        extra = f' ({n} child task(s))'
+    elif 'task' in typ:
+        extra = f' task={task}'
     print(f'  [{src}] {typ} {job}{extra}')
 " 2>/dev/null || warn "无法获取事件"
 
 echo ""
+echo "── 链路检查点 ──"
+[[ "$SAW_PLANNER_DONE"  == "1" ]] && ok  "planner job 终态" || fail "planner job 未完成"
+[[ "$SAW_EVALUATING"    == "1" ]] && ok  "supervisor.task.evaluating（spawn+child 已跑）" || fail "task.evaluating 未出现"
+[[ -n "$CHILD_TASK_TERMINAL"  ]] && ok  "child task 终态: $CHILD_TASK_TERMINAL" || fail "child task 未到终态"
+echo ""
 
 # 最终判定
-if [[ "$FINAL_STATUS" == "agent.job.completed" ]]; then
-    ok "Job 完成！端到端测试通过"
-    exit 0
-elif [[ "$FINAL_STATUS" == "agent.job.failed" ]]; then
-    warn "Job 失败（但流程跑通了）"
-    info "查看 trenni 日志: $WORK_DIR/trenni.log"
-    exit 1
+if [[ -n "$CHILD_TASK_TERMINAL" ]]; then
+    if [[ "$CHILD_TASK_TERMINAL" == "supervisor.task.completed" ]]; then
+        ok "端到端 smoke 通过（semantic completed）"
+        exit 0
+    else
+        warn "链路跑通，child task 终态为: $CHILD_TASK_TERMINAL"
+        info "查看 trenni 日志: $WORK_DIR/trenni.log"
+        exit 1
+    fi
 elif [[ $ELAPSED -ge $JOB_TIMEOUT ]]; then
-    warn "等待超时 (${JOB_TIMEOUT}s)，job 可能仍在运行"
-    info "查看 trenni 日志: $WORK_DIR/trenni.log"
-    info "查看 pasloe 日志: $WORK_DIR/pasloe.log"
+    warn "等待超时 (${JOB_TIMEOUT}s)"
+    info "trenni 日志: $WORK_DIR/trenni.log"
+    info "pasloe 日志: $WORK_DIR/pasloe.log"
     exit 2
 else
-    warn "Job launch 成功但未产生终态事件"
-    info "查看 trenni 日志最后 20 行:"
+    warn "链路未完成"
     tail -20 "$WORK_DIR/trenni.log" | sed 's/^/  /'
     exit 1
 fi
