@@ -126,7 +126,7 @@ class RuntimeSpecBuilder:
         return JobRuntimeSpec(
             job_id=job_id,
             source_event_id=source_event_id,
-            container_name=f"yoitsu-job-{job_id}",
+            container_name=f"yoitsu-job-{job_id.replace('/', '-')}",
             image=self.defaults.image,
             pod_name=self.defaults.pod_name,
             labels=labels,
