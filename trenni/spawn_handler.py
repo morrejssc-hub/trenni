@@ -155,13 +155,18 @@ class SpawnHandler:
 
         if parent_job is not None and child_task_ids:
             join_token = self._id_hash(f"{parent_task_id}:{event.id}:join")
+            join_task = self._join_task_instruction(parent_job.task)
+            join_role_params = dict(parent_job.role_params)
+            join_role_params["goal"] = join_task
+            join_role_params["parent_goal"] = parent_job.task
+            join_role_params["mode"] = "join"
             jobs.append(
                 SpawnedJob(
                     job_id=f"{parent_job_id}-j{join_token}",
                     source_event_id=event.id,
-                    task=parent_job.task,
+                    task=join_task,
                     role=parent_job.role,
-                    role_params=dict(parent_job.role_params),
+                    role_params=join_role_params,
                     repo=parent_job.repo,
                     init_branch=parent_job.init_branch,
                     evo_sha=parent_job.evo_sha,
@@ -212,6 +217,18 @@ class SpawnHandler:
             )
         return AllCondition(
             conditions=[TaskIsCondition(task_id=task_id, state="terminal") for task_id in child_task_ids]
+        )
+
+    @staticmethod
+    def _join_task_instruction(parent_goal: str) -> str:
+        return (
+            "Review the completed child tasks for the parent goal below.\n\n"
+            "This is a continuation planning step, not a fresh planning pass.\n"
+            "Your job is to use join_context to decide whether the parent goal is already satisfied.\n"
+            "If the goal is satisfied, stop and summarize the completion.\n"
+            "If there is a clear gap, spawn only the minimal follow-up tasks needed to close it.\n"
+            "Do not recreate work that child tasks have already completed.\n\n"
+            f"Parent goal:\n{parent_goal}"
         )
 
     @staticmethod

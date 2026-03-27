@@ -90,6 +90,7 @@ async def test_handle_trigger_with_team_defaults_to_planner_role():
     job = sup._ready_queue.get_nowait()
     assert job.role == "custom-planner"
     assert job.team == "backend"
+    assert job.role_params["mode"] == "initial"
 
 
 @pytest.mark.asyncio
@@ -198,6 +199,48 @@ async def test_handle_spawn_creates_children_no_continuation():
     assert c0.role == "worker"
     assert c0.depends_on == frozenset()
     assert len(sup._pending) == 0
+
+
+def test_spawn_handler_join_job_uses_continuation_instruction():
+    sup = _make_supervisor()
+    parent = SpawnedJob(
+        "parent-1",
+        "e1",
+        "Parent goal",
+        "planner",
+        "/repo",
+        "main",
+        "sha1",
+        role_params={"goal": "Parent goal"},
+        task_id="root-task",
+    )
+    sup.state.jobs_by_id["parent-1"] = parent
+    sup.state.spawn_defaults_by_job["parent-1"] = SpawnDefaults(
+        repo="/repo",
+        init_branch="main",
+        role="planner",
+        evo_sha="sha1",
+        role_params={"goal": "Parent goal"},
+        task_id="root-task",
+    )
+
+    event = _evt("spawn-join", "agent.job.spawn_request", {
+        "job_id": "parent-1",
+        "task_id": "root-task",
+        "tasks": [
+            {"goal": "child A", "role": "implementer", "params": {"repo": "/repo", "branch": "main"}},
+        ],
+    })
+
+    plan = sup.spawn_handler.expand(event)
+    join_jobs = [job for job in plan.jobs if job.job_context.join is not None]
+    assert len(join_jobs) == 1
+    join_job = join_jobs[0]
+    assert "continuation planning step" in join_job.task
+    assert join_job.role == "planner"
+    assert join_job.role_params["goal"] == join_job.task
+    assert join_job.role_params["parent_goal"] == "Parent goal"
+    assert join_job.role_params["mode"] == "join"
 
 
 @pytest.mark.asyncio

@@ -80,7 +80,7 @@ def build_control_app(supervisor: "Supervisor") -> FastAPI:
             tasks.append(item)
         return tasks
 
-    @app.get("/control/tasks/{task_id}")
+    @app.get("/control/tasks/{task_id:path}")
     async def task_detail(task_id: str):
         record = supervisor.state.tasks.get(task_id)
         if record is None:

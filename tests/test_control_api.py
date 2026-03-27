@@ -51,6 +51,12 @@ class TestStatus:
         assert r.status_code == 200
         assert r.json()["goal"] == "ship"
 
+    async def test_task_detail_endpoint_accepts_hierarchical_task_id(self, client, supervisor):
+        supervisor.state.tasks["root/ab12"] = TaskRecord(task_id="root/ab12", goal="child", team="backend", state="running")
+        r = await client.get("/control/tasks/root/ab12")
+        assert r.status_code == 200
+        assert r.json()["task_id"] == "root/ab12"
+
     async def test_jobs_endpoint_returns_live_state(self, client, supervisor):
         supervisor.state.jobs_by_id["j1"] = SpawnedJob("j1", "e1", "ship", "default", "/r", "main", None, task_id="t1")
         await supervisor.state.ready_queue.put(supervisor.state.jobs_by_id["j1"])

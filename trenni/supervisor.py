@@ -355,6 +355,8 @@ class Supervisor:
         role = data.context.get("role") or data.context.get("planner_role") or team_def.planner_role or "planner"
         role_params = dict(data.context.get("params", {}))
         role_params.setdefault("goal", data.goal)
+        if role == team_def.planner_role:
+            role_params.setdefault("mode", "initial")
         if data.budget:
             role_params.setdefault("budget", data.budget)
         repo = data.context.get("repo", "")
