@@ -52,22 +52,37 @@ class RuntimeSpecBuilder:
         source_event_id: str,
         task: str,
         role: str,
-        role_params: dict | None = None,
+        role_params: dict | None = None,  # only role-internal flags
         team: str = "default",
         repo: str,
         init_branch: str,
         evo_sha: str | None,
-        llm_overrides: dict | None = None,
-        workspace_overrides: dict | None = None,
-        publication_overrides: dict | None = None,
+        budget: float | None = None,  # NEW: single-channel budget per ADR-0007
         job_context: JobContextConfig | None = None,
     ) -> JobRuntimeSpec:
+        """Build JobRuntimeSpec from task semantics and role-derived defaults.
+
+        Per ADR-0007:
+        - Execution config (llm, workspace, publication) comes from TrenniConfig defaults.
+        - budget maps to llm.max_total_cost (single channel).
+        - No overrides from spawn payload.
+        """
+        # Workspace: use defaults + repo/init_branch from spawn
         merged_workspace = {
             **self.config.default_workspace,
-            **(workspace_overrides or {}),
             "repo": repo,
             "init_branch": init_branch,
         }
+
+        # LLM: use defaults + budget (single channel)
+        llm_config = dict(self.config.default_llm)
+        if budget is not None and budget > 0:
+            llm_config["max_total_cost"] = budget
+        # else: use default from TrenniConfig
+
+        # Publication: use defaults only (no overrides)
+        publication_config = dict(self.config.default_publication)
+
         job_config = JobConfig.model_validate(
             {
                 "job_id": job_id,
@@ -78,14 +93,8 @@ class RuntimeSpecBuilder:
                 "role_params": dict(role_params or {}),
                 "team": team,
                 "workspace": merged_workspace,
-                "llm": {
-                    **self.config.default_llm,
-                    **(llm_overrides or {}),
-                },
-                "publication": {
-                    **self.config.default_publication,
-                    **(publication_overrides or {}),
-                },
+                "llm": llm_config,
+                "publication": publication_config,
                 "eventstore": EventStoreConfig(
                     url=self.config.eventstore_url,
                     api_key_env=self.config.pasloe_api_key_env,

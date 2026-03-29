@@ -30,6 +30,7 @@ class SpawnedJob:
         repo: Repository URL.
         init_branch: Starting branch.
         evo_sha: Git SHA for evo version.
+        budget: Maximum cost for this task (task semantics field).
         role_params: Role-internal behavior flags only (e.g. mode="join").
         depends_on: Job IDs this job waits for.
         task_id: Reference to the task this job belongs to.
@@ -49,6 +50,7 @@ class SpawnedJob:
     repo: str
     init_branch: str
     evo_sha: str | None
+    budget: float = 0.0  # task semantics field per ADR-0007 Decision 1
     role_params: dict[str, Any] = field(default_factory=dict)  # only role-internal flags
     depends_on: frozenset[str] = field(default_factory=frozenset)
     task_id: str = ""

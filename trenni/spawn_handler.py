@@ -38,49 +38,47 @@ class SpawnHandler:
         parent_task_id = parent_job.task_id if parent_job and parent_job.task_id else parent_job_id
         wait_for, on_fail = self._normalize_strategy(payload.wait_for, payload.on_fail)
         child_defs: list[
-            tuple[str, str, str, str, dict, str, str, str | None, dict, dict, dict, str, EvalSpec | None]
+            tuple[str, str, str, str, dict, str, str, str | None, str, EvalSpec | None, float]
         ] = []
 
         for index, child in enumerate(payload.tasks):
-            prompt = (child.goal or child.prompt).strip()
-            if not prompt:
+            goal = (child.goal or child.prompt).strip()
+            if not goal:
                 continue
 
             token = self._id_hash(f"{parent_task_id}:{event.id}:{index}")
             task_id = f"{parent_task_id}/{token}"
             job_id = f"{parent_job_id}-c{token}"
             role = child.role or self._inherit("role", parent_job, parent_defaults, "default")
+            
+            # Per ADR-0007: role_params contains only role-internal flags (not goal/budget)
             role_params = dict(child.params or {})
-            role_params.setdefault("goal", prompt)
-            if child.budget:
-                role_params.setdefault("budget", float(child.budget))
-            repo = str(role_params.get("repo") or self._inherit("repo", parent_job, parent_defaults, ""))
-            init_branch = str(role_params.get("branch") or role_params.get("init_branch") or self._inherit("init_branch", parent_job, parent_defaults, "main"))
+            # goal and budget are NOT written to role_params
+            
+            # repo is a first-class field; fall back to params for backward compat
+            repo = child.repo or child.params.get("repo") or self._inherit("repo", parent_job, parent_defaults, "")
+            init_branch = child.params.get("branch") or child.params.get("init_branch") or self._inherit("init_branch", parent_job, parent_defaults, "main")
             evo_sha = child.sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
-
-            llm = dict(self._inherit("llm_overrides", parent_job, parent_defaults, {}))
-            if child.budget:
-                llm["max_total_cost"] = float(child.budget)
-
-            workspace = dict(self._inherit("workspace_overrides", parent_job, parent_defaults, {}))
-            publication = dict(self._inherit("publication_overrides", parent_job, parent_defaults, {}))
+            
+            # Per ADR-0007: llm/workspace/publication overrides removed
+            # budget goes to single channel (handled by runtime_builder)
+            budget = child.budget
+            
             team = self._inherit("team", parent_job, parent_defaults, "default")
 
             child_defs.append(
                 (
                     task_id,
                     job_id,
-                    prompt,
+                    goal,
                     role,
                     role_params,
                     repo,
                     init_branch,
                     evo_sha,
-                    llm,
-                    workspace,
-                    publication,
                     team,
                     child.eval_spec,
+                    budget,
                 )
             )
 
@@ -88,7 +86,7 @@ class SpawnHandler:
         child_tasks = [
             TaskRecord(
                 task_id=task_id,
-                goal=prompt,
+                goal=goal,
                 source_event_id=event.id,
                 spec={
                     "role": role,
@@ -101,11 +99,11 @@ class SpawnHandler:
                 team=team,
                 eval_spec=eval_spec,
             )
-            for task_id, _, prompt, role, role_params, repo, init_branch, evo_sha, *_, team, eval_spec in child_defs
+            for task_id, _, goal, role, role_params, repo, init_branch, evo_sha, team, eval_spec, _ in child_defs
         ]
 
         jobs: list[SpawnedJob] = []
-        for task_id, job_id, prompt, role, role_params, repo, init_branch, evo_sha, llm, workspace, publication, team, _ in child_defs:
+        for task_id, job_id, goal, role, role_params, repo, init_branch, evo_sha, team, _, budget in child_defs:
             sibling_ids = [candidate for candidate in child_task_ids if candidate != task_id]
             guard_conditions = []
 
@@ -137,15 +135,13 @@ class SpawnHandler:
                 SpawnedJob(
                     job_id=job_id,
                     source_event_id=event.id,
-                    task=prompt,
+                    task=goal,
                     role=role,
                     role_params=role_params,
                     repo=repo,
                     init_branch=init_branch,
                     evo_sha=evo_sha,
-                    llm_overrides=llm,
-                    workspace_overrides=workspace,
-                    publication_overrides=publication,
+                    budget=budget or 0.0,  # task semantics field
                     task_id=task_id,
                     condition=self._combine_conditions(guard_conditions),
                     parent_job_id=parent_job_id,
@@ -156,10 +152,11 @@ class SpawnHandler:
         if parent_job is not None and child_task_ids:
             join_token = self._id_hash(f"{parent_task_id}:{event.id}:join")
             join_task = self._join_task_instruction(parent_job.task)
-            join_role_params = dict(parent_job.role_params)
-            join_role_params["goal"] = join_task
-            join_role_params["parent_goal"] = parent_job.task
-            join_role_params["mode"] = "join"
+            
+            # Per ADR-0007: join role_params contains only mode="join"
+            # parent_goal goes to JobContextConfig.join.parent_summary
+            join_role_params = {"mode": "join"}
+            
             jobs.append(
                 SpawnedJob(
                     job_id=f"{parent_job_id}-j{join_token}",
@@ -170,9 +167,7 @@ class SpawnHandler:
                     repo=parent_job.repo,
                     init_branch=parent_job.init_branch,
                     evo_sha=parent_job.evo_sha,
-                    llm_overrides=dict(parent_job.llm_overrides),
-                    workspace_overrides=dict(parent_job.workspace_overrides),
-                    publication_overrides=dict(parent_job.publication_overrides),
+                    budget=parent_job.budget,  # inherit budget from parent
                     task_id=parent_job.task_id or payload.task_id or parent_job.job_id,
                     condition=self._join_condition(child_task_ids, wait_for),
                     job_context=JobContextConfig(

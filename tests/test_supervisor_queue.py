@@ -139,8 +139,8 @@ async def test_handle_trigger_budget_propagates_to_root_job():
     await sup._handle_trigger(event)
 
     job = sup._ready_queue.get_nowait()
-    assert job.role_params["budget"] == 0.75
-    assert job.llm_overrides["max_total_cost"] == 0.75
+    # Per ADR-0007: budget is SpawnedJob.budget field, not in role_params or llm_overrides
+    assert job.budget == 0.75
 
 
 @pytest.mark.asyncio
@@ -238,9 +238,9 @@ def test_spawn_handler_join_job_uses_continuation_instruction():
     join_job = join_jobs[0]
     assert "continuation planning step" in join_job.task
     assert join_job.role == "planner"
-    assert join_job.role_params["goal"] == join_job.task
-    assert join_job.role_params["parent_goal"] == "Parent goal"
+    # Per ADR-0007: role_params only has mode="join", parent_goal in JobContextConfig.join.parent_summary
     assert join_job.role_params["mode"] == "join"
+    assert join_job.job_context.join.parent_summary == "Parent goal"
 
 
 @pytest.mark.asyncio
@@ -310,9 +310,6 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_params_fields()
         role="parent-role",
         evo_sha="parent-sha",
         task_id="task-1",
-        llm_overrides={"model": "kimi-parent"},
-        workspace_overrides={"depth": 2},
-        publication_overrides={"branch_prefix": "parent/job"},
     )
     event = _evt("spawn-inherit", "agent.job.spawn_request", {
         "job_id": "parent-1",
@@ -330,8 +327,8 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_params_fields()
     assert child.init_branch == "parent-branch"
     assert child.evo_sha == "parent-sha"
     assert child.team == "default"
-    assert child.llm_overrides["model"] == "kimi-parent"
-    assert child.publication_overrides["branch_prefix"] == "parent/job"
+    # Per ADR-0007: no execution config overrides inherited
+    assert child.budget == 0.0
 
 
 def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
@@ -355,8 +352,8 @@ def test_build_eval_job_uses_evaluator_role_and_git_ref_branch():
     assert job.role == "custom-evaluator"
     assert job.team == "backend"
     assert job.init_branch == "palimpsest/job/j1"
-    assert job.workspace_overrides["new_branch"] is False
-    assert job.publication_overrides["strategy"] == "skip"
+    # Per ADR-0007: eval job uses role_params for eval-specific flags, not overrides
+    assert job.role_params.get("eval_mode") is True
 
 
 @pytest.mark.asyncio
@@ -423,8 +420,9 @@ async def test_team_trigger_spawn_and_eval_flow():
     child_task_id = child_task_ids[0]
     child_job = next(job for job in sup.state.ready_queue_snapshot() if job.task_id == child_task_id)
     assert child_job.role == "implementer"
-    assert child_job.role_params["goal"] == "Implement backend refactor"
-    assert child_job.llm_overrides["max_total_cost"] == 0.6
+    # Per ADR-0007: goal is SpawnedJob.task, budget is SpawnedJob.budget
+    assert child_job.task == "Implement backend refactor"
+    assert child_job.budget == 0.6
 
     sup.state.jobs_by_id[child_job.job_id] = child_job
     sup.state.drop_from_ready_queue(child_job.job_id)
@@ -838,8 +836,7 @@ async def test_checkpoint_reaps_timed_out_containers():
     sup.state.tasks["t1"] = TaskRecord(task_id="t1", goal="...")
     sup.state.jobs_by_id["j1"] = SpawnedJob(
         job_id="j1", source_event_id="e1", task="t", role="default",
-        repo="r", init_branch="b", evo_sha="s", llm_overrides={},
-        workspace_overrides={}, publication_overrides={}, task_id="t1"
+        repo="r", init_branch="b", evo_sha="s", task_id="t1"
     )
     handle = JobHandle(
         "j1",

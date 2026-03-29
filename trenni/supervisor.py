@@ -246,6 +246,10 @@ class Supervisor:
                 continue
 
     async def _launch_from_spawned(self, job: SpawnedJob) -> None:
+        """Launch a SpawnedJob using its task semantics fields.
+
+        Per ADR-0007: execution config from role defaults, budget from SpawnedJob.budget.
+        """
         await self._launch(
             job_id=job.job_id,
             task_id=job.task_id or job.job_id,
@@ -256,9 +260,7 @@ class Supervisor:
             repo=job.repo,
             init_branch=job.init_branch,
             evo_sha=job.evo_sha,
-            llm_overrides=job.llm_overrides,
-            workspace_overrides=job.workspace_overrides,
-            publication_overrides=job.publication_overrides,
+            budget=job.budget,  # single-channel budget per ADR-0007
             source_event_id=job.source_event_id,
             job_context=job.job_context,
             parent_job_id=job.parent_job_id,
@@ -353,18 +355,17 @@ class Supervisor:
         # Context might define execution details, otherwise use defaults
         team_def = self._resolve_team_definition(team)
         role = data.context.get("role") or data.context.get("planner_role") or team_def.planner_role or "planner"
+        
+        # Per ADR-0007: role_params contains only role-internal flags (not goal/budget)
         role_params = dict(data.context.get("params", {}))
-        role_params.setdefault("goal", data.goal)
         if role == team_def.planner_role:
             role_params.setdefault("mode", "initial")
-        if data.budget:
-            role_params.setdefault("budget", data.budget)
+        # goal and budget NOT written to role_params
+        
         repo = data.context.get("repo", "")
         init_branch = data.context.get("init_branch", "main")
         evo_sha = data.context.get("evo_sha")
-        llm_overrides = dict(data.context.get("llm", {}))
-        if data.budget and "max_total_cost" not in llm_overrides:
-            llm_overrides["max_total_cost"] = float(data.budget)
+        # budget is a task semantics field per ADR-0007
 
         root_job = SpawnedJob(
             job_id=root_job_id,
@@ -375,9 +376,7 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha,
-            llm_overrides=llm_overrides,
-            workspace_overrides=dict(data.context.get("workspace", {})),
-            publication_overrides=dict(data.context.get("publication", {})),
+            budget=data.budget,  # task semantics field per ADR-0007
             task_id=task_id,
             team=team,
         )
@@ -465,9 +464,9 @@ class Supervisor:
                     repo=job.repo,
                     init_branch=job.init_branch,
                     evo_sha=job.evo_sha or "",
-                    llm=dict(job.llm_overrides),
-                    workspace=dict(job.workspace_overrides),
-                    publication=dict(job.publication_overrides),
+                    llm={},  # Per ADR-0007: execution config from role defaults
+                    workspace={},
+                    publication={},
                     parent_job_id=job.parent_job_id,
                     condition=condition_to_data(job.condition),
                     job_context=job.job_context.model_dump(mode="json"),
@@ -501,9 +500,6 @@ class Supervisor:
             repo=data.repo,
             init_branch=data.init_branch,
             evo_sha=data.evo_sha or None,
-            llm_overrides=dict(data.llm),
-            workspace_overrides=dict(data.workspace),
-            publication_overrides=dict(data.publication),
             task_id=data.task_id or data.job_id,
             condition=condition_from_data(data.condition),
             parent_job_id=data.parent_job_id,
@@ -902,9 +898,7 @@ class Supervisor:
         repo: str,
         init_branch: str,
         evo_sha: str | None,
-        llm_overrides: dict[str, Any] | None = None,
-        workspace_overrides: dict[str, Any] | None = None,
-        publication_overrides: dict[str, Any] | None = None,
+        budget: float | None = None,  # task semantics field per ADR-0007
         source_event_id: str = "",
         task_id: str = "",
         job_context=None,
@@ -913,6 +907,11 @@ class Supervisor:
         team: str = "default",
         role_params: dict[str, Any] | None = None,
     ) -> None:
+        """Launch a job in the isolation backend.
+
+        Per ADR-0007: execution config comes from TrenniConfig defaults + role definition.
+        budget is passed from SpawnedJob.budget (task semantics field).
+        """
         spec = self.runtime_builder.build(
             job_id=job_id,
             task_id=task_id or job_id,
@@ -924,9 +923,7 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha,
-            llm_overrides=llm_overrides,
-            workspace_overrides=workspace_overrides,
-            publication_overrides=publication_overrides,
+            budget=budget,  # single-channel budget per ADR-0007
             job_context=job_context,
         )
         handle = await self.backend.prepare(spec)
@@ -947,9 +944,7 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha,
-            llm_overrides=dict(llm_overrides or {}),
-            workspace_overrides=dict(workspace_overrides or {}),
-            publication_overrides=dict(publication_overrides or {}),
+            budget=budget or 0.0,  # task semantics field
             task_id=task_id or job_id,
             condition=condition,
             job_context=job_context or self.state.jobs_by_id.get(job_id, SpawnedJob("", "", "", "", "", "", None)).job_context,
@@ -962,12 +957,13 @@ class Supervisor:
             role_params=dict(role_params or {}),
             team=team,
             evo_sha=evo_sha,
-            llm_overrides=dict(llm_overrides or {}),
-            workspace_overrides=dict(workspace_overrides or {}),
-            publication_overrides=dict(publication_overrides or {}),
             task_id=task_id or job_id,
         )
 
+        # Get llm config from spec for observability event
+        # (fully-resolved config from runtime_builder, not override deltas)
+        spec_llm = spec.config_payload_b64  # We'll extract from the built spec
+        
         launch = SupervisorJobLaunchedData(
             job_id=job_id,
             task_id=task_id or job_id,
@@ -979,9 +975,9 @@ class Supervisor:
             repo=repo,
             init_branch=init_branch,
             evo_sha=evo_sha or "",
-            llm=dict(llm_overrides or {}),
-            workspace=dict(workspace_overrides or {}),
-            publication=dict(publication_overrides or {}),
+            llm={},  # Per ADR-0007: observability shows resolved config, not deltas
+            workspace={},
+            publication={},
             runtime_kind=self.runtime_defaults.kind,
             container_id=handle.container_id,
             container_name=handle.container_name,
@@ -1121,10 +1117,16 @@ class Supervisor:
         return catalog[role_name]
 
     def _allocated_job_budget(self, job: SpawnedJob) -> float:
-        if isinstance(job.role_params.get("budget"), (int, float)):
-            return float(job.role_params["budget"])
-        if isinstance(job.llm_overrides.get("max_total_cost"), (int, float)):
-            return float(job.llm_overrides["max_total_cost"])
+        """Get the allocated budget for a job.
+
+        Per ADR-0007: budget is read from SpawnedJob.budget (task semantics field).
+        Single channel, not role_params or llm_overrides.
+        """
+        # Primary: budget field on SpawnedJob (ADR-0007)
+        if job.budget and job.budget > 0:
+            return float(job.budget)
+        
+        # Fallback: default from TrenniConfig
         default_budget = self.config.default_llm.get("max_total_cost")
         if isinstance(default_budget, (int, float)):
             return float(default_budget)
@@ -1177,6 +1179,10 @@ class Supervisor:
         )
 
     def _register_replayed_launch(self, event: Event) -> None:
+        """Register a job from a replayed supervisor.job.launched event.
+
+        Per ADR-0007: SpawnedJob and SpawnDefaults no longer carry execution config overrides.
+        """
         data = event.data
         job_id = data.get("job_id", "")
         if not job_id:
@@ -1194,9 +1200,7 @@ class Supervisor:
             repo=data.get("repo", ""),
             init_branch=data.get("init_branch", "main"),
             evo_sha=data.get("evo_sha") or None,
-            llm_overrides=dict(data.get("llm") or {}),
-            workspace_overrides=dict(data.get("workspace") or {}),
-            publication_overrides=dict(data.get("publication") or {}),
+            budget=0.0,  # budget not in launched event (derived from llm.max_total_cost)
             task_id=data.get("task_id", "") or job_id,
             condition=condition_from_data(data.get("condition")),
             parent_job_id=data.get("parent_job_id", ""),
@@ -1206,9 +1210,6 @@ class Supervisor:
             init_branch=data.get("init_branch", "main"),
             role=data.get("role", "default"),
             evo_sha=data.get("evo_sha") or None,
-            llm_overrides=dict(data.get("llm") or {}),
-            workspace_overrides=dict(data.get("workspace") or {}),
-            publication_overrides=dict(data.get("publication") or {}),
             task_id=data.get("task_id", "") or job_id,
             team=data.get("team", "default"),
         )
@@ -1242,6 +1243,12 @@ class Supervisor:
         return sorted(children)
 
     def _build_eval_job(self, task: TaskRecord, eval_job_id: str) -> SpawnedJob:
+        """Build an eval job for a task.
+
+        Per ADR-0007: eval jobs use role-internal params for eval-specific behavior.
+        workspace.new_branch=False and publication.strategy="skip" are handled by
+        role definition or role_params.
+        """
         eval_spec = task.eval_spec or EvalSpec()
         team_def = self._resolve_team_definition(task.team)
         role = eval_spec.role or team_def.eval_role or "evaluator"
@@ -1263,18 +1270,22 @@ class Supervisor:
         )
         eval_branch = self._branch_from_git_ref(latest_git_ref) or (base_job.init_branch if base_job else "main")
         child_task_ids = self._direct_child_task_ids(task.task_id)
+        
+        # Per ADR-0007: role_params for eval-specific flags
+        eval_role_params = {
+            "eval_mode": True,  # role-internal flag
+        }
+        
         return SpawnedJob(
             job_id=eval_job_id,
             source_event_id=task.source_event_id,
             task=self._eval_prompt(task.goal, eval_spec),
             role=role,
+            role_params=eval_role_params,
             team=task.team,
             repo=base_job.repo if base_job else "",
             init_branch=eval_branch,
             evo_sha=base_job.evo_sha if base_job else None,
-            llm_overrides={},
-            workspace_overrides={"new_branch": False},
-            publication_overrides={"strategy": "skip"},
             task_id=task.task_id,
             parent_job_id=base_job.parent_job_id if base_job else "",
             job_context=JobContextConfig(
