@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import ast
 import hashlib
 import json
 import logging
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +35,7 @@ from yoitsu_contracts.events import (
     TaskTraceEntry,
     TriggerData,
 )
+from yoitsu_contracts.role_metadata import RoleMetadataReader
 
 from .checkpoint import mark_exited_jobs, reap_timed_out_jobs
 from .config import TrenniConfig
@@ -101,7 +102,11 @@ class Supervisor:
         self._webhook_id: str | None = None
         self._webhook_active = False
         self._webhook_poll_not_before: float = 0.0
+        
+        # Role catalog with SHA-based invalidation per ADR-0007
         self._role_catalog_cache: dict[str, dict[str, Any]] | None = None
+        self._role_metadata_reader: RoleMetadataReader | None = None
+        self._cached_evo_sha: str | None = None
 
     @property
     def event_cursor(self) -> str | None:
@@ -1067,38 +1072,55 @@ class Supervisor:
             return Path(self.config.evo_root)
         return Path(__file__).resolve().parents[2] / "palimpsest" / "evo"
 
+    def _read_evo_sha(self) -> str:
+        """Read current HEAD SHA from evo root for cache invalidation."""
+        evo_root = self._team_root()
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(evo_root), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
     def _load_role_catalog(self) -> dict[str, dict[str, Any]]:
+        """Load role catalog with SHA-based cache invalidation.
+
+        Per ADR-0007: cache is invalidated when evo SHA changes.
+        Uses RoleMetadataReader from yoitsu-contracts for AST parsing.
+        """
+        current_sha = self._read_evo_sha()
+        
+        # Invalidate cache if SHA changed
+        if current_sha != self._cached_evo_sha:
+            self._role_catalog_cache = None
+            if self._role_metadata_reader:
+                self._role_metadata_reader.invalidate_cache()
+            self._cached_evo_sha = current_sha
+
         if self._role_catalog_cache is not None:
             return self._role_catalog_cache
 
-        roles_dir = self._team_root() / "roles"
+        # Use RoleMetadataReader for AST-based parsing
+        if self._role_metadata_reader is None:
+            self._role_metadata_reader = RoleMetadataReader(self._team_root())
+
+        definitions = self._role_metadata_reader.list_definitions()
         catalog: dict[str, dict[str, Any]] = {}
-        if roles_dir.exists():
-            for py_path in sorted(roles_dir.glob("*.py")):
-                if py_path.name.startswith("_"):
-                    continue
-                module_ast = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
-                for node in module_ast.body:
-                    if not isinstance(node, ast.FunctionDef):
-                        continue
-                    for deco in node.decorator_list:
-                        if not isinstance(deco, ast.Call):
-                            continue
-                        func = deco.func
-                        if not isinstance(func, ast.Name) or func.id != "role":
-                            continue
-                        keywords = {kw.arg: ast.literal_eval(kw.value) for kw in deco.keywords if kw.arg is not None}
-                        role_name = str(keywords.get("name", node.name))
-                        catalog[role_name] = {
-                            "name": role_name,
-                            "description": keywords.get("description", ""),
-                            "role_type": keywords.get("role_type", "worker"),
-                            "teams": list(keywords.get("teams", ["default"])),
-                            "min_cost": float(keywords.get("min_cost", 0.0) or 0.0),
-                            "recommended_cost": float(keywords.get("recommended_cost", 0.0) or 0.0),
-                            "min_capability": str(keywords.get("min_capability", "") or ""),
-                        }
-                        break
+        for meta in definitions:
+            catalog[meta.name] = {
+                "name": meta.name,
+                "description": meta.description,
+                "role_type": meta.role_type,
+                "teams": list(meta.teams),
+                "min_cost": meta.min_cost,
+                "recommended_cost": meta.recommended_cost,
+                "min_capability": meta.min_capability,
+            }
+        
         self._role_catalog_cache = catalog
         return catalog
 
