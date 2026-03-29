@@ -17,6 +17,31 @@ def _queue_factory() -> asyncio.Queue["SpawnedJob"]:
 
 @dataclass
 class SpawnedJob:
+    """Job specification passed from spawn_handler to runtime_builder.
+
+    Per ADR-0007, this contains only task semantics and runtime identity.
+    Execution config (llm, workspace, publication) is derived from role definition.
+
+    Fields:
+        job_id: Unique identifier assigned by Trenni.
+        source_event_id: The spawn event that created this job.
+        task: The goal text (authoritative task description).
+        role: Role type to execute this task.
+        repo: Repository URL.
+        init_branch: Starting branch.
+        evo_sha: Git SHA for evo version.
+        role_params: Role-internal behavior flags only (e.g. mode="join").
+        depends_on: Job IDs this job waits for.
+        task_id: Reference to the task this job belongs to.
+        condition: Optional condition for conditional execution.
+        job_context: Join/eval context configuration.
+        parent_job_id: Job ID of the spawning parent.
+        team: Team that owns this task (inherited, not overridable).
+
+    Removed per ADR-0007:
+        llm_overrides, workspace_overrides, publication_overrides
+    """
+
     job_id: str
     source_event_id: str
     task: str
@@ -24,10 +49,7 @@ class SpawnedJob:
     repo: str
     init_branch: str
     evo_sha: str | None
-    role_params: dict[str, Any] = field(default_factory=dict)
-    llm_overrides: dict[str, Any] = field(default_factory=dict)
-    workspace_overrides: dict[str, Any] = field(default_factory=dict)
-    publication_overrides: dict[str, Any] = field(default_factory=dict)
+    role_params: dict[str, Any] = field(default_factory=dict)  # only role-internal flags
     depends_on: frozenset[str] = field(default_factory=frozenset)
     task_id: str = ""
     condition: Condition | None = None
@@ -38,14 +60,20 @@ class SpawnedJob:
 
 @dataclass
 class SpawnDefaults:
+    """Default values inherited by spawned jobs.
+
+    Per ADR-0007, this contains only task semantics defaults.
+    Execution config defaults come from TrenniConfig and role definition.
+
+    Removed per ADR-0007:
+        llm_overrides, workspace_overrides, publication_overrides
+    """
+
     repo: str
     init_branch: str
     role: str
     evo_sha: str | None
-    role_params: dict[str, Any] = field(default_factory=dict)
-    llm_overrides: dict[str, Any] = field(default_factory=dict)
-    workspace_overrides: dict[str, Any] = field(default_factory=dict)
-    publication_overrides: dict[str, Any] = field(default_factory=dict)
+    role_params: dict[str, Any] = field(default_factory=dict)  # only role-internal flags
     task_id: str = ""
     team: str = "default"
 
