@@ -406,6 +406,10 @@ class Supervisor:
         if not payload.tasks:
             return
 
+        # ADR-0007 D9: ensure role catalog reflects current evo/ state before
+        # any role resolution or budget validation in this spawn expansion.
+        self._load_role_catalog()
+
         plan = self.spawn_handler.expand(event)
         for task in plan.child_tasks:
             self.state.tasks[task.task_id] = task
