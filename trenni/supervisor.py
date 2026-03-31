@@ -11,6 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from yoitsu_contracts.observation import (
+    ObservationBudgetVarianceData,
+    OBSERVATION_BUDGET_VARIANCE,
+)
 from yoitsu_contracts.conditions import condition_from_data, condition_to_data
 from yoitsu_contracts.config import EvalContextConfig, JobContextConfig, JoinContextConfig
 from yoitsu_contracts.events import (
@@ -558,6 +562,10 @@ class Supervisor:
         if handle is not None and not replay:
             await self._cleanup_handle(handle, failed=is_failure or is_cancelled)
 
+        # ADR-0010 D5: Emit budget_variance observation for completed jobs
+        if not replay and not is_failure and not is_cancelled:
+            await self._emit_budget_variance(job_id, event)
+
         if not replay:
             await self._evaluate_task_termination(job_id=job_id, task_id=task_id, event=event)
 
@@ -967,6 +975,7 @@ class Supervisor:
             team=team,
             evo_sha=evo_sha,
             task_id=task_id or job_id,
+            budget=budget or 0.0,  # ADR-0010: for budget_variance observation
         )
 
         # Get llm config from spec for observability event
@@ -1238,6 +1247,7 @@ class Supervisor:
             evo_sha=data.get("evo_sha") or None,
             task_id=data.get("task_id", "") or job_id,
             team=data.get("team", "default"),
+            budget=0.0,  # budget not available in launched event
         )
         if source_event_id:
             self._launched_event_ids.add(source_event_id)
@@ -1356,6 +1366,37 @@ class Supervisor:
         if ":" not in git_ref:
             return ""
         return git_ref.split(":", 1)[0].strip()
+
+    async def _emit_budget_variance(self, job_id: str, event: Event) -> None:
+        """Emit budget_variance observation after job completion (ADR-0010 D5).
+        
+        Uses spawn_defaults for estimated_budget and event.data for actual cost.
+        """
+        spawn_defaults = self._spawn_defaults_by_job.get(job_id)
+        if not spawn_defaults or spawn_defaults.budget <= 0:
+            return  # No estimated budget, skip variance calculation
+        
+        job = self.state.jobs_by_id.get(job_id)
+        if not job:
+            return
+        
+        estimated_budget = spawn_defaults.budget
+        actual_cost = float(event.data.get("cost", 0.0) or 0.0)
+        
+        if estimated_budget > 0:
+            variance_ratio = (actual_cost - estimated_budget) / estimated_budget
+            
+            await self.client.emit(
+                OBSERVATION_BUDGET_VARIANCE,
+                ObservationBudgetVarianceData(
+                    task_id=job.task_id or job_id,
+                    job_id=job_id,
+                    role=job.role,
+                    estimated_budget=estimated_budget,
+                    actual_cost=actual_cost,
+                    variance_ratio=variance_ratio,
+                ).model_dump(),
+            )
 
     @staticmethod
     def _event_idempotency_key(*, source_event_id: str, event_type: str, entity_id: str) -> str | None:

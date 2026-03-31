@@ -78,6 +78,7 @@ class SpawnDefaults:
     role_params: dict[str, Any] = field(default_factory=dict)  # only role-internal flags
     task_id: str = ""
     team: str = "default"
+    budget: float = 0.0  # ADR-0010: for budget_variance observation
 
 
 @dataclass
