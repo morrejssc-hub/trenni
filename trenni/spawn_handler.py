@@ -51,7 +51,7 @@ class SpawnHandler:
             token = self._id_hash(f"{parent_task_id}:{event.id}:{index}")
             task_id = f"{parent_task_id}/{token}"
             job_id = f"{parent_job_id}-c{token}"
-            role = child.role or self._inherit("role", parent_job, parent_defaults, "default")
+            role = child.role or "planner"  # ADR-0008 D1: default to planner when unspecified
             
             # Per ADR-0007: role_params contains only role-internal flags (not goal/budget)
             role_params = dict(child.params or {})
