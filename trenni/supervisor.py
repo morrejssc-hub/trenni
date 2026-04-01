@@ -1123,6 +1123,9 @@ class Supervisor:
         """Load role catalog with SHA-based cache invalidation.
 
         Per ADR-0007: cache is invalidated when evo SHA changes.
+        Per ADR-0011 D2/D3: Team membership is determined by directory location:
+        - evo/roles/<name>.py → available to all teams (teams = ["*"])
+        - evo/teams/<team>/roles/<name>.py → available only to <team> (teams = [team_name])
         Uses RoleMetadataReader from yoitsu-contracts for AST parsing.
         """
         current_sha = self._read_evo_sha()
@@ -1137,25 +1140,130 @@ class Supervisor:
         if self._role_catalog_cache is not None:
             return self._role_catalog_cache
 
-        # Use RoleMetadataReader for AST-based parsing
-        if self._role_metadata_reader is None:
-            self._role_metadata_reader = RoleMetadataReader(self._team_root())
-
-        definitions = self._role_metadata_reader.list_definitions()
         catalog: dict[str, dict[str, Any]] = {}
-        for meta in definitions:
-            catalog[meta.name] = {
-                "name": meta.name,
-                "description": meta.description,
-                "role_type": meta.role_type,
-                "teams": list(meta.teams),
-                "min_cost": meta.min_cost,
-                "recommended_cost": meta.recommended_cost,
-                "min_capability": meta.min_capability,
-            }
-        
+        evo_root = self._team_root()
+
+        # Scan global roles (available to all teams)
+        global_roles_dir = evo_root / "roles"
+        if global_roles_dir.exists():
+            reader = RoleMetadataReader(evo_root)
+            for meta in reader.list_definitions():
+                catalog[meta.name] = {
+                    "name": meta.name,
+                    "description": meta.description,
+                    "role_type": meta.role_type,
+                    "teams": ["*"],  # Available to all teams (ADR-0011 D2)
+                    "min_cost": meta.min_cost,
+                    "recommended_cost": meta.recommended_cost,
+                    "max_cost": meta.max_cost,
+                    "min_capability": meta.min_capability,
+                    "source_team": None,  # Global role
+                }
+
+        # Scan team-specific roles (ADR-0011 D3)
+        teams_dir = evo_root / "teams"
+        if teams_dir.exists():
+            for team_dir in teams_dir.iterdir():
+                if not team_dir.is_dir():
+                    continue
+                team_name = team_dir.name
+                team_roles_dir = team_dir / "roles"
+                if not team_roles_dir.exists():
+                    continue
+                # Create a reader scoped to this team's roles directory
+                for py_path in sorted(team_roles_dir.glob("*.py")):  
+                    if py_path.name.startswith("_"):
+                        continue
+                    meta = self._read_role_file(py_path, evo_root)
+                    if meta is None:
+                        continue
+                    catalog[meta.name] = {
+                        "name": meta.name,
+                        "description": meta.description,
+                        "role_type": meta.role_type,
+                        "teams": [team_name],  # Only this team (ADR-0011 D3)
+                        "min_cost": meta.min_cost,
+                        "recommended_cost": meta.recommended_cost,
+                        "max_cost": meta.max_cost,
+                        "min_capability": meta.min_capability,
+                        "source_team": team_name,  # Team-specific role
+                    }
+
         self._role_catalog_cache = catalog
         return catalog
+
+    def _read_role_file(self, py_path: Path, evo_root: Path) -> "RoleMetadata | None":
+        """Read role metadata from a single Python file using AST parsing.
+
+        This is a lightweight version of RoleMetadataReader._read_role_file
+        for scanning team-specific role directories.
+        """
+        import ast
+        from dataclasses import dataclass, field
+        from typing import Any
+
+        @dataclass
+        class RoleMetadata:
+            name: str
+            description: str
+            teams: list[str] = field(default_factory=list)
+            role_type: str = "worker"
+            min_cost: float = 0.0
+            recommended_cost: float = 0.0
+            max_cost: float = 10.0
+            min_capability: str = ""
+
+        source = py_path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                for decorator in node.decorator_list:
+                    if isinstance(decorator, ast.Call):
+                        if self._is_role_decorator_ast(decorator):
+                            return self._extract_metadata_ast(decorator, py_path, RoleMetadata)
+        return None
+
+    def _is_role_decorator_ast(self, decorator: "ast.Call") -> bool:
+        """Check if decorator call is @role(...)."""
+        import ast
+        if isinstance(decorator.func, ast.Name):
+            return decorator.func.id == "role"
+        if isinstance(decorator.func, ast.Attribute):
+            if decorator.func.attr == "role":
+                return True
+        return False
+
+    def _extract_metadata_ast(self, decorator: "ast.Call", py_path: Path, RoleMetadata: type) -> "RoleMetadata":
+        """Extract RoleMetadata from @role(...) decorator keywords."""
+        import ast
+        from typing import Any
+
+        kwargs: dict[str, Any] = {}
+        for keyword in decorator.keywords:
+            try:
+                value = ast.literal_eval(keyword.value)
+            except ValueError as e:
+                raise ValueError(
+                    f"Role decorator argument '{keyword.arg}' in {py_path} "
+                    f"must be a literal expression. Got non-literal: {ast.unparse(keyword.value)}. "
+                    f"Error: {e}"
+                ) from e
+            kwargs[keyword.arg] = value
+
+        return RoleMetadata(
+            name=str(kwargs.get("name", "")),
+            description=str(kwargs.get("description", "")),
+            teams=list(kwargs.get("teams", [])),  # Ignored per ADR-0011 D3
+            role_type=str(kwargs.get("role_type", "worker")),
+            min_cost=float(kwargs.get("min_cost", 0.0)),
+            recommended_cost=float(kwargs.get("recommended_cost", 0.0)),
+            max_cost=float(kwargs.get("max_cost", 10.0)),
+            min_capability=str(kwargs.get("min_capability", "")),
+        )
 
     def _validate_role_catalog(self) -> None:
         catalog = self._load_role_catalog()
@@ -1203,34 +1311,55 @@ class Supervisor:
 
     def _resolve_team_definition(self, name: str):
         team_name = (name or "default").strip() or "default"
+        catalog = self._load_role_catalog()
+        
+        # Per ADR-0011 D2/D3: Find roles available to this team
+        # - Global roles have teams = ["*"] (available to all)
+        # - Team-specific roles have teams = [team_name]
         members = [
             meta
-            for meta in self._load_role_catalog().values()
-            if team_name in meta.get("teams", ["default"])
+            for meta in catalog.values()
+            if "*" in meta.get("teams", []) or team_name in meta.get("teams", [])
         ]
+        
         if not members:
             if team_name == "default":
                 return _DEFAULT_TEAM_DEFINITION
             raise FileNotFoundError(f"No roles found for team {team_name!r}")
 
-        planners = [member["name"] for member in members if member["role_type"] == "planner"]
-        evaluators = [member["name"] for member in members if member["role_type"] == "evaluator"]
-        workers = [member["name"] for member in members if member["role_type"] == "worker"]
+        # Prefer team-specific planners/evaluators over global ones
+        # If team has its own planner, exclude global planners
+        team_planners = [m for m in members if m["role_type"] == "planner" and m.get("source_team") == team_name]
+        global_planners = [m for m in members if m["role_type"] == "planner" and m.get("source_team") is None]
+        
+        team_evaluators = [m for m in members if m["role_type"] == "evaluator" and m.get("source_team") == team_name]
+        global_evaluators = [m for m in members if m["role_type"] == "evaluator" and m.get("source_team") is None]
+        
+        # Use team-specific planners if available, otherwise global
+        planners = team_planners if team_planners else global_planners
+        evaluators = team_evaluators if team_evaluators else global_evaluators
+        
+        # Workers are additive (both global and team-specific)
+        workers = [m for m in members if m["role_type"] == "worker"]
+        
+        planner_names = [m["name"] for m in planners]
+        evaluator_names = [m["name"] for m in evaluators]
+        worker_names = [m["name"] for m in workers]
 
-        if len(planners) != 1:
+        if len(planner_names) != 1:
             raise ValueError(f"Team {team_name!r} must have exactly one planner role")
-        if len(evaluators) > 1:
+        if len(evaluator_names) > 1:
             raise ValueError(f"Team {team_name!r} must have at most one evaluator role")
-        if not workers:
+        if not worker_names:
             raise ValueError(f"Team {team_name!r} must have at least one worker role")
 
         return SimpleNamespace(
             name=team_name,
             description=f"Derived team {team_name}",
-            roles=[member["name"] for member in members],
-            planner_role=planners[0],
-            eval_role=evaluators[0] if evaluators else _DEFAULT_TEAM_DEFINITION.eval_role,
-            worker_roles=workers,
+            roles=[m["name"] for m in members],
+            planner_role=planner_names[0],
+            eval_role=evaluator_names[0] if evaluator_names else _DEFAULT_TEAM_DEFINITION.eval_role,
+            worker_roles=worker_names,
         )
 
     def _register_replayed_launch(self, event: Event) -> None:
