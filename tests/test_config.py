@@ -7,6 +7,7 @@ from trenni.config import (
     TeamSchedulingConfig,
     TeamConfig,
     TrenniConfig,
+    _UNSET,
 )
 
 
@@ -17,7 +18,7 @@ class TestTeamRuntimeConfig:
         """TeamRuntimeConfig should have sensible defaults."""
         config = TeamRuntimeConfig()
         assert config.image is None
-        assert config.pod_name is None
+        assert config.pod_name is _UNSET  # Sentinel value for "not set"
         assert config.env_allowlist == []
         assert config.extra_networks == []
 
@@ -39,7 +40,7 @@ class TestTeamRuntimeConfig:
         """TeamRuntimeConfig.from_dict should handle None input."""
         config = TeamRuntimeConfig.from_dict(None)
         assert config.image is None
-        assert config.pod_name is None
+        assert config.pod_name is _UNSET  # Sentinel value for "not set"
         assert config.env_allowlist == []
         assert config.extra_networks == []
 
@@ -47,7 +48,7 @@ class TestTeamRuntimeConfig:
         """TeamRuntimeConfig.from_dict should handle empty dict."""
         config = TeamRuntimeConfig.from_dict({})
         assert config.image is None
-        assert config.pod_name is None
+        assert config.pod_name is _UNSET  # Sentinel value for "not set"
         assert config.env_allowlist == []
         assert config.extra_networks == []
 
@@ -56,9 +57,29 @@ class TestTeamRuntimeConfig:
         data = {"image": "partial-image"}
         config = TeamRuntimeConfig.from_dict(data)
         assert config.image == "partial-image"
-        assert config.pod_name is None
+        assert config.pod_name is _UNSET  # Sentinel value for "not set"
         assert config.env_allowlist == []
         assert config.extra_networks == []
+
+    def test_from_dict_with_explicit_null_pod_name(self):
+        """TeamRuntimeConfig.from_dict should distinguish explicit null from unset."""
+        data = {"pod_name": None}
+        config = TeamRuntimeConfig.from_dict(data)
+        assert config.pod_name is None  # Explicit null means "no pod"
+
+    def test_from_dict_unset_vs_null_semantics(self):
+        """TeamRuntimeConfig should distinguish unset from explicit null for pod_name."""
+        # Unset pod_name (missing key)
+        config_unset = TeamRuntimeConfig.from_dict({"image": "test"})
+        assert config_unset.pod_name is _UNSET
+
+        # Explicit null pod_name
+        config_null = TeamRuntimeConfig.from_dict({"image": "test", "pod_name": None})
+        assert config_null.pod_name is None
+
+        # Explicit string pod_name
+        config_string = TeamRuntimeConfig.from_dict({"image": "test", "pod_name": "my-pod"})
+        assert config_string.pod_name == "my-pod"
 
 
 class TestTeamSchedulingConfig:
@@ -139,7 +160,7 @@ class TestTeamConfig:
         data = {"runtime": {"image": "partial-image"}}
         config = TeamConfig.from_dict(data)
         assert config.runtime.image == "partial-image"
-        assert config.runtime.pod_name is None
+        assert config.runtime.pod_name is _UNSET  # Sentinel value for "not set"
         assert config.scheduling.max_concurrent_jobs == 0
 
     def test_from_dict_with_only_scheduling(self):

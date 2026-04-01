@@ -7,7 +7,7 @@ import yaml
 from yoitsu_contracts.config import EventStoreConfig, JobConfig, JobContextConfig
 from yoitsu_contracts.env import build_git_auth_env
 
-from .config import TeamRuntimeConfig, TrenniConfig
+from .config import TeamRuntimeConfig, TrenniConfig, _UNSET
 from .runtime_types import JobRuntimeSpec, RuntimeDefaults
 
 build_git_credential_env = build_git_auth_env
@@ -130,12 +130,16 @@ class RuntimeSpecBuilder:
 
         # Merge semantics per ADR-0011 D4:
         # - image: team value overrides default if set (None = use default)
-        # - pod_name: team value overrides default if set (None = no pod)
+        # - pod_name: team value overrides default if set (None = no pod); unset inherits default
         # - env_allowlist: team value replaces default (not merged)
         # - extra_networks: team value used (default is empty)
         if team_runtime is not None:
             image = team_runtime.image if team_runtime.image is not None else self.defaults.image
-            pod_name = team_runtime.pod_name  # None = no pod (explicit override)
+            # pod_name: _UNSET = inherit default; None = explicit no pod; string = use that value
+            if team_runtime.pod_name is _UNSET:
+                pod_name = self.defaults.pod_name
+            else:
+                pod_name = team_runtime.pod_name  # Could be None (explicit no pod) or string
             env_allowlist = tuple(team_runtime.env_allowlist) if team_runtime.env_allowlist else self.defaults.env_allowlist
             extra_networks = tuple(team_runtime.extra_networks)
         else:

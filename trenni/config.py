@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Final
 
 import yaml
+
+
+# Sentinel value to distinguish "unset" from "explicit null" for pod_name
+_UNSET: Final[object] = object()
 
 
 @dataclass
@@ -38,19 +43,27 @@ class RuntimeConfig:
         )
 
 
+def _is_unset(value: object) -> bool:
+    """Check if a value is the unset sentinel."""
+    return value is _UNSET
+
+
 @dataclass
 class TeamRuntimeConfig:
     image: str | None = None
-    pod_name: str | None = None
+    # pod_name uses sentinel to distinguish "unset" (inherit default) from "explicit null" (no pod)
+    pod_name: str | None | object = _UNSET  # type: ignore[assignment]
     env_allowlist: list[str] = field(default_factory=list)
     extra_networks: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "TeamRuntimeConfig":
         payload = data or {}
+        # Use sentinel for missing key to distinguish from explicit null/None
+        pod_name = payload.get("pod_name", _UNSET)
         return cls(
             image=payload.get("image"),
-            pod_name=payload.get("pod_name"),
+            pod_name=pod_name,
             env_allowlist=list(payload.get("env_allowlist", [])),
             extra_networks=list(payload.get("extra_networks", [])),
         )
