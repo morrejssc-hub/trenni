@@ -97,7 +97,7 @@ class Supervisor:
         self._launched_event_ids = self.state.launched_event_ids
         self._spawn_defaults_by_job = self.state.spawn_defaults_by_job
 
-        self.scheduler = Scheduler(self.state, max_workers=config.max_workers)
+        self.scheduler = Scheduler(self.state, max_workers=config.max_workers, teams=config.teams)
         self.spawn_handler = SpawnHandler(self.state)
 
         self._checkpoint_cycles = _DEFAULT_CHECKPOINT_CYCLES

@@ -1,22 +1,48 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Mapping
 
 from yoitsu_contracts.conditions import evaluate_condition
 from yoitsu_contracts.events import EvalSpec
 
-from .state import SpawnedJob, SupervisorState, TaskRecord
+from .config import TeamConfig
+from .state import SpawnedJob, SupervisorState, TaskRecord, TeamLaunchCondition
 
 _TASK_TERMINAL_STATES = {"complete", "failed", "cancelled"}
 
 
 class Scheduler:
-    def __init__(self, state: SupervisorState, *, max_workers: int) -> None:
+    def __init__(
+        self,
+        state: SupervisorState,
+        *,
+        max_workers: int,
+        teams: Mapping[str, TeamConfig] | None = None,
+    ) -> None:
         self.state = state
         self.max_workers = max_workers
+        self.teams: Mapping[str, TeamConfig] = teams or {}
 
     def has_capacity(self) -> bool:
         return len(self.state.running_jobs) < self.max_workers
+
+    def has_team_capacity(self, team: str) -> bool:
+        """Check if team has capacity for another job.
+
+        Returns True if:
+        - Team not configured (no limit)
+        - Team max_concurrent_jobs is 0 or negative (unlimited)
+        - Current running count < max_concurrent_jobs
+        """
+        team_config = self.teams.get(team)
+        if team_config is None:
+            return True  # No config for team = no limit
+
+        condition = TeamLaunchCondition(
+            team=team, max_concurrent=team_config.scheduling.max_concurrent_jobs
+        )
+        return condition.is_satisfied(self.state)
 
     def evaluate_job(self, job: SpawnedJob) -> bool | None:
         if job.condition is not None:
@@ -52,8 +78,14 @@ class Scheduler:
 
         outcome = self.evaluate_job(job)
         if outcome is True:
-            await self.state.ready_queue.put(job)
-            return []
+            # Check team capacity before putting in ready queue
+            if self.has_team_capacity(job.team):
+                await self.state.ready_queue.put(job)
+                return []
+            else:
+                # Team at capacity - keep pending
+                self.state.pending_jobs[job.job_id] = job
+                return []
         if outcome is False:
             return [job]
 
@@ -135,9 +167,12 @@ class Scheduler:
         for job_id, job in list(self.state.pending_jobs.items()):
             outcome = self.evaluate_job(job)
             if outcome is True:
-                del self.state.pending_jobs[job_id]
-                await self.state.ready_queue.put(job)
-                ready.append(job)
+                # Check team capacity before putting in ready queue
+                if self.has_team_capacity(job.team):
+                    del self.state.pending_jobs[job_id]
+                    await self.state.ready_queue.put(job)
+                    ready.append(job)
+                # else: keep in pending, team at capacity
             elif outcome is False:
                 del self.state.pending_jobs[job_id]
                 cancelled.append(job)
