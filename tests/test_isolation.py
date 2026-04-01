@@ -145,7 +145,18 @@ async def test_podman_backend_ensure_ready_pulls_missing_image():
     )
     backend = PodmanBackend(defaults, transport=httpx.MockTransport(handler))
 
-    await backend.ensure_ready()
+    spec = JobRuntimeSpec(
+        job_id="test-job",
+        source_event_id="evt-1",
+        container_name="test-container",
+        image="localhost/yoitsu-palimpsest-job:dev",
+        pod_name="yoitsu-dev",
+        labels={},
+        env={},
+        command=("/bin/bash",),
+        config_payload_b64="",
+    )
+    await backend.ensure_ready(spec)
     await backend.close()
 
     assert ("POST", "/v1.0.0/libpod/images/pull") in calls

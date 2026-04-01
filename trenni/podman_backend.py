@@ -27,19 +27,34 @@ class PodmanBackend:
             await self._client.aclose()
             self._client = None
 
-    async def ensure_ready(self) -> None:
-        await self._ensure_pod_exists(self.defaults.pod_name)
-        await self._ensure_image_available(self.defaults.image, self.defaults.pull_policy)
+    async def ensure_ready(self, spec: JobRuntimeSpec) -> None:
+        # Check pod only if pod_name is not None
+        if spec.pod_name is not None:
+            await self._ensure_pod_exists(spec.pod_name)
+
+        await self._ensure_image_available(spec.image, self.defaults.pull_policy)
+
+        # Validate extra networks exist
+        for network in spec.extra_networks:
+            await self._ensure_network_exists(network)
 
     async def prepare(self, spec: JobRuntimeSpec) -> JobHandle:
-        payload = {
+        payload: dict[str, Any] = {
             "name": spec.container_name,
             "image": spec.image,
-            "pod": spec.pod_name,
             "env": dict(spec.env),
             "labels": dict(spec.labels),
             "command": list(spec.command),
         }
+
+        # Only include pod if pod_name is not None
+        if spec.pod_name is not None:
+            payload["pod"] = spec.pod_name
+
+        # Attach extra networks
+        if spec.extra_networks:
+            payload["networks"] = list(spec.extra_networks)
+
         response = await self._request("POST", "/libpod/containers/create", json=payload)
         data = response.json()
         return JobHandle(
@@ -130,6 +145,16 @@ class PodmanBackend:
         )
         if response.status_code == 404:
             raise RuntimeError(f"Podman pod {pod_name!r} does not exist")
+
+    async def _ensure_network_exists(self, network_name: str) -> None:
+        """Validate that a network exists in Podman."""
+        response = await self._request(
+            "GET",
+            f"/libpod/networks/{quote(network_name, safe='')}/exists",
+            expected={204, 404},
+        )
+        if response.status_code == 404:
+            raise RuntimeError(f"Podman network {network_name!r} does not exist")
 
     async def _ensure_image_available(self, image: str, pull_policy: str) -> None:
         image_exists = await self._image_exists(image)
