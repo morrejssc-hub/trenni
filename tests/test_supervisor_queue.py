@@ -246,7 +246,6 @@ def test_spawn_handler_join_job_uses_continuation_instruction():
 @pytest.mark.asyncio
 async def test_supervisor_start_validates_role_catalog_before_loop():
     sup = _make_supervisor()
-    sup.backend.ensure_ready = AsyncMock()
     sup.client.register_source = AsyncMock()
     sup._validate_role_catalog = MagicMock(side_effect=ValueError("broken team"))
     sup._replay_unfinished_tasks = AsyncMock()
@@ -757,6 +756,7 @@ async def test_launch_emits_container_identity():
         command=("palimpsest", "container-entrypoint"),
         config_payload_b64="abc",
     ))
+    sup.backend.ensure_ready = AsyncMock()
     sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock()
 
@@ -787,6 +787,7 @@ async def test_launch_removes_container_when_start_fails():
         command=("palimpsest", "container-entrypoint"),
         config_payload_b64="abc",
     ))
+    sup.backend.ensure_ready = AsyncMock()
     sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock(side_effect=RuntimeError("boom"))
     sup.backend.remove = AsyncMock()
@@ -796,6 +797,100 @@ async def test_launch_removes_container_when_start_fails():
                           source_event_id="evt-src-123")
 
     sup.backend.remove.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_launch_calls_ensure_ready_before_prepare():
+    """Verify that _launch calls ensure_ready(spec) before prepare(spec)."""
+    sup = _make_supervisor()
+
+    # Track call order
+    call_order: list[str] = []
+    captured_spec: JobRuntimeSpec | None = None
+
+    spec = JobRuntimeSpec(
+        job_id="job-xyz",
+        source_event_id="evt-src-123",
+        container_name="yoitsu-job-job-xyz",
+        image="localhost/yoitsu-palimpsest-job:dev",
+        pod_name="yoitsu-dev",
+        extra_networks=("network-a",),
+        labels={},
+        env={"PALIMPSEST_JOB_CONFIG_B64": "abc"},
+        command=("palimpsest", "container-entrypoint"),
+        config_payload_b64="abc",
+    )
+
+    async def mock_ensure_ready(s: JobRuntimeSpec) -> None:
+        call_order.append("ensure_ready")
+        nonlocal captured_spec
+        captured_spec = s
+
+    async def mock_prepare(s: JobRuntimeSpec) -> JobHandle:
+        call_order.append("prepare")
+        return JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz")
+
+    async def mock_start(h: JobHandle) -> None:
+        call_order.append("start")
+
+    sup.runtime_builder.build = MagicMock(return_value=spec)
+    sup.backend.ensure_ready = mock_ensure_ready
+    sup.backend.prepare = mock_prepare
+    sup.backend.start = mock_start
+    sup.client.emit = AsyncMock()
+
+    await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
+                      source_event_id="evt-src-123")
+
+    # Verify call order: ensure_ready must be called before prepare
+    assert call_order == ["ensure_ready", "prepare", "start"], \
+        f"Expected ensure_ready before prepare, got: {call_order}"
+
+    # Verify spec was passed correctly to ensure_ready
+    assert captured_spec is not None
+    assert captured_spec.job_id == "job-xyz"
+    assert captured_spec.pod_name == "yoitsu-dev"
+    assert captured_spec.extra_networks == ("network-a",)
+
+
+@pytest.mark.asyncio
+async def test_launch_propagates_ensure_ready_errors():
+    """Verify that errors from ensure_ready prevent container creation."""
+    sup = _make_supervisor()
+
+    spec = JobRuntimeSpec(
+        job_id="job-xyz",
+        source_event_id="evt-src-123",
+        container_name="yoitsu-job-job-xyz",
+        image="localhost/missing-image:dev",
+        pod_name="missing-pod",
+        labels={},
+        env={"PALIMPSEST_JOB_CONFIG_B64": "abc"},
+        command=("palimpsest", "container-entrypoint"),
+        config_payload_b64="abc",
+    )
+
+    async def mock_ensure_ready(s: JobRuntimeSpec) -> None:
+        raise RuntimeError("Podman pod 'missing-pod' does not exist")
+
+    prepare_called = False
+
+    async def mock_prepare(s: JobRuntimeSpec) -> JobHandle:
+        nonlocal prepare_called
+        prepare_called = True
+        return JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz")
+
+    sup.runtime_builder.build = MagicMock(return_value=spec)
+    sup.backend.ensure_ready = mock_ensure_ready
+    sup.backend.prepare = mock_prepare
+    sup.client.emit = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="missing-pod"):
+        await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
+                          source_event_id="evt-src-123")
+
+    # Verify prepare was never called due to ensure_ready failure
+    assert not prepare_called, "prepare should not be called when ensure_ready fails"
 
 
 @pytest.mark.asyncio
@@ -1098,8 +1193,7 @@ async def test_start_calls_runtime_ready_replay_and_drain():
 
     sup._replay_unfinished_tasks = fake_replay
 
-    with patch.object(sup.backend, "ensure_ready", new_callable=AsyncMock) as mock_ready, \
-         patch.object(sup, "_try_register_webhook", new_callable=AsyncMock), \
+    with patch.object(sup, "_try_register_webhook", new_callable=AsyncMock), \
          patch.object(sup, "_run_loop", new_callable=AsyncMock) as mock_run_loop, \
          patch.object(sup.client, "register_source", new_callable=AsyncMock), \
          patch.object(sup.client, "close", new_callable=AsyncMock), \
@@ -1127,7 +1221,6 @@ async def test_start_calls_runtime_ready_replay_and_drain():
         await sup.start()
 
     assert replay_called
-    mock_ready.assert_called_once()
     mock_run_loop.assert_called_once()
     mock_create_task.assert_called_once()
     mock_task.cancel.assert_called_once()

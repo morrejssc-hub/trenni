@@ -133,7 +133,6 @@ class Supervisor:
         self.running = True
         drain_task: asyncio.Task | None = None
         try:
-            await self.backend.ensure_ready()
             await self.client.register_source()
             self._validate_role_catalog()
             await self._replay_unfinished_tasks()
@@ -956,6 +955,10 @@ class Supervisor:
             budget=budget,  # single-channel budget per ADR-0007
             job_context=job_context,
         )
+
+        # Validate runtime environment before container creation
+        await self.backend.ensure_ready(spec)
+
         handle = await self.backend.prepare(spec)
         try:
             await self.backend.start(handle)
