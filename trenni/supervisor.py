@@ -1429,7 +1429,7 @@ class Supervisor:
             repo=data.get("repo", ""),
             init_branch=data.get("init_branch", "main"),
             evo_sha=data.get("evo_sha") or None,
-            budget=0.0,
+            budget=data.get("budget", 0.0),
             task_id=data.get("task_id", "") or job_id,
             condition=condition_from_data(data.get("condition")),
             parent_job_id=data.get("parent_job_id", ""),
@@ -1441,7 +1441,7 @@ class Supervisor:
             evo_sha=data.get("evo_sha") or None,
             task_id=data.get("task_id", "") or job_id,
             team=data.get("team", "default"),
-            budget=0.0,  # budget not available in launched event
+            budget=data.get("budget", 0.0),
         )
         if source_event_id:
             self._launched_event_ids.add(source_event_id)
