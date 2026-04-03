@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from yoitsu_contracts.artifact import ArtifactBinding
 from yoitsu_contracts.observation import (
     ObservationBudgetVarianceData,
     OBSERVATION_BUDGET_VARIANCE,
@@ -285,6 +286,7 @@ class Supervisor:
             job_context=job.job_context,
             parent_job_id=job.parent_job_id,
             condition=job.condition,
+            input_artifacts=job.input_artifacts,  # ADR-0013
         )
 
     async def _poll_and_handle(self) -> None:
@@ -349,7 +351,7 @@ class Supervisor:
         await self._process_trigger(event, data, replay=replay)
 
     async def _handle_external_event(self, event: Event, *, replay: bool = False) -> None:
-        """Handle external events (CI failure, labeled issues/PRs).
+        """Handle external events (CI failure, labeled issues/PRs, observation thresholds).
 
         Converts external events to TriggerData and processes them.
         """
@@ -357,9 +359,11 @@ class Supervisor:
             CIFailureEvent,
             IssueLabeledEvent,
             PRLabeledEvent,
+            ObservationThresholdEvent,
             ci_failure_to_trigger,
             issue_labeled_to_trigger,
             pr_labeled_to_trigger,
+            observation_threshold_to_trigger,
         )
 
         event_type = event.data.get("event_type", "")
@@ -375,6 +379,9 @@ class Supervisor:
             elif event_type == "pr_labeled":
                 external = PRLabeledEvent.model_validate(event.data)
                 trigger_data = pr_labeled_to_trigger(external)
+            elif event_type == "observation_threshold":
+                external = ObservationThresholdEvent.model_validate(event.data)
+                trigger_data = observation_threshold_to_trigger(external)
             else:
                 logger.warning("Unknown external event type: %s", event_type)
                 return
@@ -456,6 +463,7 @@ class Supervisor:
             budget=data.budget,
             task_id=task_id,
             team=team,
+            input_artifacts=list(data.input_artifacts),  # ADR-0013
         )
         budget_error = self._validate_spawned_job_budget(root_job)
         if budget_error:
@@ -607,6 +615,10 @@ class Supervisor:
         # ADR-0010 D5: Emit budget_variance observation for completed jobs
         if not replay and not is_failure and not is_cancelled:
             await self._emit_budget_variance(job_id, event)
+
+        # ADR-0010: Handle optimizer output - parse ReviewProposal and spawn optimization task
+        if not replay and not is_failure and not is_cancelled:
+            await self._handle_optimizer_output(job_id, job_record, event)
 
         if not replay:
             await self._evaluate_task_termination(job_id=job_id, task_id=task_id, event=event)
@@ -972,6 +984,7 @@ class Supervisor:
         condition=None,
         team: str = "default",
         role_params: dict[str, Any] | None = None,
+        input_artifacts: list | None = None,  # ADR-0013
     ) -> None:
         """Launch a job in the isolation backend."""
         spec = self.runtime_builder.build(
@@ -987,6 +1000,7 @@ class Supervisor:
             evo_sha=evo_sha,
             budget=budget,
             job_context=job_context,
+            input_artifacts=input_artifacts,  # ADR-0013
         )
 
         # Validate runtime environment before container creation
@@ -1475,6 +1489,12 @@ class Supervisor:
 
         source_event_id = data.get("source_event_id", "")
 
+        # ADR-0013: restore input_artifacts from event data
+        input_artifacts_data = data.get("input_artifacts", [])
+        input_artifacts = [
+            ArtifactBinding.model_validate(b) for b in input_artifacts_data
+        ] if input_artifacts_data else []
+
         existing = self.state.jobs_by_id.get(job_id)
         self.state.jobs_by_id[job_id] = existing or SpawnedJob(
             job_id=job_id,
@@ -1489,6 +1509,7 @@ class Supervisor:
             task_id=data.get("task_id", "") or job_id,
             condition=condition_from_data(data.get("condition")),
             parent_job_id=data.get("parent_job_id", ""),
+            input_artifacts=input_artifacts,  # ADR-0013
         )
         self._spawn_defaults_by_job[job_id] = SpawnDefaults(
             repo=data.get("repo", ""),
@@ -1647,6 +1668,76 @@ class Supervisor:
                     variance_ratio=variance_ratio,
                 ).model_dump(),
             )
+
+    async def _handle_optimizer_output(
+        self,
+        job_id: str,
+        job: SpawnedJob | None,
+        event: Event,
+    ) -> None:
+        """Handle optimizer role output - parse ReviewProposal and spawn optimization task.
+
+        Per ADR-0010: The optimizer role outputs structured proposals that can be
+        converted into optimization tasks. This method:
+        1. Detects if the completed job was an optimizer role
+        2. Parses the summary field as ReviewProposal JSON
+        3. Converts the proposal to a TriggerData
+        4. Spawns the optimization task via _process_trigger
+
+        Parsing failures are logged but do not interrupt normal flow.
+        """
+        from yoitsu_contracts.review_proposal import ReviewProposal
+        from yoitsu_contracts.external_events import review_proposal_to_trigger
+
+        # Only process optimizer role
+        if job is None or job.role != "optimizer":
+            return
+
+        # Extract summary (contains the ReviewProposal JSON)
+        summary = event.data.get("summary", "")
+        if not summary:
+            logger.warning("Optimizer job %s completed without summary", job_id)
+            return
+
+        # Parse ReviewProposal from summary
+        proposal = ReviewProposal.from_json_str(summary)
+        if proposal is None:
+            logger.warning(
+                "Optimizer job %s summary could not be parsed as ReviewProposal",
+                job_id,
+            )
+            return
+
+        # Convert proposal to trigger data
+        trigger_data = review_proposal_to_trigger(proposal)
+
+        # Create synthetic event for _process_trigger
+        synthetic_event = SimpleNamespace(
+            id=f"{job_id}-proposal",
+            source_id=self.config.source_id,
+            type="trigger.review_proposal",
+            data=trigger_data,
+            ts=datetime.now(timezone.utc),
+        )
+
+        # Validate as TriggerData
+        try:
+            data = TriggerData.model_validate(trigger_data)
+        except Exception as e:
+            logger.warning(
+                "Optimizer proposal from job %s failed TriggerData validation: %s",
+                job_id,
+                e,
+            )
+            return
+
+        # Process the trigger to spawn optimization task
+        logger.info(
+            "Spawning optimization task from optimizer job %s: goal=%s",
+            job_id,
+            data.goal[:50] if data.goal else "",
+        )
+        await self._process_trigger(synthetic_event, data, replay=False)
 
     @staticmethod
     def _event_idempotency_key(*, source_event_id: str, event_type: str, entity_id: str) -> str | None:

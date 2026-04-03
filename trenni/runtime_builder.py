@@ -4,6 +4,7 @@ import base64
 import os
 
 import yaml
+from yoitsu_contracts.artifact import ArtifactBinding
 from yoitsu_contracts.config import EventStoreConfig, JobConfig, JobContextConfig
 from yoitsu_contracts.env import build_git_auth_env
 
@@ -66,14 +67,20 @@ class RuntimeSpecBuilder:
         evo_sha: str | None,
         budget: float | None = None,
         job_context: JobContextConfig | None = None,
+        input_artifacts: list[ArtifactBinding] | None = None,  # ADR-0013
     ) -> JobRuntimeSpec:
         """Build JobRuntimeSpec from task semantics and role-derived defaults."""
-        # Workspace: use defaults + repo/init_branch from spawn
+        # Workspace: use defaults + repo/init_branch/input_artifacts from spawn
         merged_workspace = {
             **self.config.default_workspace,
             "repo": repo,
             "init_branch": init_branch,
         }
+        # ADR-0013: propagate input_artifacts from SpawnedJob
+        if input_artifacts:
+            merged_workspace["input_artifacts"] = [
+                b.model_dump(mode="json") for b in input_artifacts
+            ]
 
         # LLM: use defaults + budget (single channel)
         llm_config = dict(self.config.default_llm)

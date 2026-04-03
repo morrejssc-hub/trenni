@@ -155,6 +155,7 @@ class SpawnHandler:
                     condition=self._combine_conditions(guard_conditions),
                     parent_job_id=parent_job_id,
                     team=team,
+                    input_artifacts=list(child.input_artifacts),  # ADR-0013
                 )
             )
 

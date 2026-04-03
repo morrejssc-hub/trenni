@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from yoitsu_contracts.artifact import ArtifactBinding
 from yoitsu_contracts.conditions import Condition, condition_from_data
 from yoitsu_contracts.config import JobContextConfig
 from yoitsu_contracts.events import EvalSpec, TaskResult
@@ -38,6 +39,7 @@ class SpawnedJob:
         job_context: Join/eval context configuration.
         parent_job_id: Job ID of the spawning parent.
         team: Team that owns this task (inherited, not overridable).
+        input_artifacts: Artifacts to materialize in workspace (ADR-0013).
     """
 
     job_id: str
@@ -55,6 +57,7 @@ class SpawnedJob:
     job_context: JobContextConfig = field(default_factory=JobContextConfig)
     parent_job_id: str = ""
     team: str = "default"
+    input_artifacts: list[ArtifactBinding] = field(default_factory=list)
 
     def to_enqueued_data(self, queue_state: str, condition_data: dict | None) -> dict[str, Any]:
         """Generate SupervisorJobEnqueuedData dict from this job."""
@@ -74,6 +77,7 @@ class SpawnedJob:
             "condition": condition_data,
             "job_context": self.job_context.model_dump(mode="json"),
             "queue_state": queue_state,
+            "input_artifacts": [b.model_dump(mode="json") for b in self.input_artifacts],
         }
 
     def to_launched_data(self, runtime_kind: str, container_id: str, container_name: str, condition_data: dict | None) -> dict[str, Any]:
@@ -95,11 +99,15 @@ class SpawnedJob:
             "container_name": container_name,
             "parent_job_id": self.parent_job_id,
             "condition": condition_data,
+            "input_artifacts": [b.model_dump(mode="json") for b in self.input_artifacts],
         }
 
     @classmethod
     def from_enqueued_data(cls, data: dict[str, Any]) -> "SpawnedJob":
         """Reconstruct SpawnedJob from SupervisorJobEnqueuedData dict."""
+        from yoitsu_contracts.artifact import ArtifactBinding
+        input_artifacts_data = data.get("input_artifacts", [])
+        input_artifacts = [ArtifactBinding.model_validate(b) for b in input_artifacts_data]
         return cls(
             job_id=data["job_id"],
             source_event_id=data["source_event_id"],
@@ -115,6 +123,7 @@ class SpawnedJob:
             condition=condition_from_data(data.get("condition")),
             parent_job_id=data.get("parent_job_id", ""),
             job_context=JobContextConfig.model_validate(data.get("job_context", {})),
+            input_artifacts=input_artifacts,
         )
 
 
