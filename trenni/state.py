@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from yoitsu_contracts.conditions import Condition
+from yoitsu_contracts.conditions import Condition, condition_from_data
 from yoitsu_contracts.config import JobContextConfig
 from yoitsu_contracts.events import EvalSpec, TaskResult
 
@@ -55,6 +55,64 @@ class SpawnedJob:
     job_context: JobContextConfig = field(default_factory=JobContextConfig)
     parent_job_id: str = ""
     team: str = "default"
+
+    def to_enqueued_data(self, queue_state: str, condition_data: dict | None) -> dict[str, Any]:
+        """Generate SupervisorJobEnqueuedData dict from this job."""
+        return {
+            "job_id": self.job_id,
+            "task_id": self.task_id or self.job_id,
+            "source_event_id": self.source_event_id,
+            "goal": self.goal,
+            "role": self.role,
+            "role_params": dict(self.role_params),
+            "team": self.team,
+            "repo": self.repo,
+            "init_branch": self.init_branch,
+            "evo_sha": self.evo_sha or "",
+            "parent_job_id": self.parent_job_id,
+            "condition": condition_data,
+            "job_context": self.job_context.model_dump(mode="json"),
+            "queue_state": queue_state,
+        }
+
+    def to_launched_data(self, runtime_kind: str, container_id: str, container_name: str, condition_data: dict | None) -> dict[str, Any]:
+        """Generate SupervisorJobLaunchedData dict from this job."""
+        return {
+            "job_id": self.job_id,
+            "task_id": self.task_id or self.job_id,
+            "source_event_id": self.source_event_id,
+            "goal": self.goal,
+            "role": self.role,
+            "role_params": dict(self.role_params),
+            "team": self.team,
+            "repo": self.repo,
+            "init_branch": self.init_branch,
+            "evo_sha": self.evo_sha or "",
+            "runtime_kind": runtime_kind,
+            "container_id": container_id,
+            "container_name": container_name,
+            "parent_job_id": self.parent_job_id,
+            "condition": condition_data,
+        }
+
+    @classmethod
+    def from_enqueued_data(cls, data: dict[str, Any]) -> "SpawnedJob":
+        """Reconstruct SpawnedJob from SupervisorJobEnqueuedData dict."""
+        return cls(
+            job_id=data["job_id"],
+            source_event_id=data["source_event_id"],
+            goal=data["goal"],
+            role=data["role"],
+            role_params=dict(data.get("role_params", {})),
+            team=data.get("team", "default"),
+            repo=data["repo"],
+            init_branch=data["init_branch"],
+            evo_sha=data.get("evo_sha") or None,
+            task_id=data.get("task_id") or data["job_id"],
+            condition=condition_from_data(data.get("condition")),
+            parent_job_id=data.get("parent_job_id", ""),
+            job_context=JobContextConfig.model_validate(data.get("job_context", {})),
+        )
 
 
 @dataclass

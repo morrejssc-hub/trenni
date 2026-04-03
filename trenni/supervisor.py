@@ -478,22 +478,7 @@ class Supervisor:
         if not replay:
             await self.client.emit(
                 "supervisor.job.enqueued",
-                SupervisorJobEnqueuedData(
-                    job_id=job.job_id,
-                    task_id=job.task_id or job.job_id,
-                    source_event_id=job.source_event_id,
-                    goal=job.goal,
-                    role=job.role,
-                    role_params=dict(job.role_params),
-                    team=job.team,
-                    repo=job.repo,
-                    init_branch=job.init_branch,
-                    evo_sha=job.evo_sha or "",
-                    parent_job_id=job.parent_job_id,
-                    condition=condition_to_data(job.condition),
-                    job_context=job.job_context.model_dump(mode="json"),
-                    queue_state=queue_state,
-                ).model_dump(mode="json"),
+                job.to_enqueued_data(queue_state, condition_to_data(job.condition)),
                 idempotency_key=self._event_idempotency_key(
                     source_event_id=job.source_event_id,
                     event_type="supervisor.job.enqueued",
@@ -512,21 +497,7 @@ class Supervisor:
             return
 
         data = SupervisorJobEnqueuedData.model_validate(event.data)
-        job = SpawnedJob(
-            job_id=data.job_id,
-            source_event_id=data.source_event_id,
-            goal=data.goal,
-            role=data.role,
-            role_params=dict(data.role_params),
-            team=data.team,
-            repo=data.repo,
-            init_branch=data.init_branch,
-            evo_sha=data.evo_sha or None,
-            task_id=data.task_id or data.job_id,
-            condition=condition_from_data(data.condition),
-            parent_job_id=data.parent_job_id,
-            job_context=JobContextConfig.model_validate(data.job_context or {}),
-        )
+        job = SpawnedJob.from_enqueued_data(data.model_dump(mode="json"))
 
         if data.queue_state == "cancelled":
             await self.scheduler.record_job_terminal(
@@ -1007,25 +978,18 @@ class Supervisor:
         # Get llm config from spec for observability event
         # (fully-resolved config from runtime_builder, not override deltas)
         spec_llm = spec.config_payload_b64  # We'll extract from the built spec
-        
-        launch = SupervisorJobLaunchedData(
-            job_id=job_id,
-            task_id=task_id or job_id,
-            source_event_id=source_event_id,
-            goal=goal,
-            role=role,
-            role_params=dict(role_params or {}),
-            team=team,
-            repo=repo,
-            init_branch=init_branch,
-            evo_sha=evo_sha or "",
-            runtime_kind=self.runtime_defaults.kind,
-            container_id=handle.container_id,
-            container_name=handle.container_name,
-            parent_job_id=parent_job_id,
-            condition=condition_to_data(condition),
+
+        # Use the SpawnedJob just stored to emit the launched event
+        launched_job = self.state.jobs_by_id[job_id]
+        await self.client.emit(
+            "supervisor.job.launched",
+            launched_job.to_launched_data(
+                self.runtime_defaults.kind,
+                handle.container_id,
+                handle.container_name,
+                condition_to_data(condition),
+            ),
         )
-        await self.client.emit("supervisor.job.launched", launch.model_dump(mode="json"))
 
     async def _cleanup_handle(self, handle: JobHandle, *, failed: bool) -> None:
         if failed and self.runtime_defaults.retain_on_failure:
