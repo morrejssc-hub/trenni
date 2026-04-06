@@ -112,6 +112,14 @@ class Supervisor:
         self._role_catalog_cache: dict[str, dict[str, Any]] | None = None
         self._role_metadata_reader: RoleMetadataReader | None = None
         self._cached_evo_sha: str | None = None
+        
+        # Observation aggregation state (ADR-0010 extension)
+        self._last_aggregation: float = 0.0
+        # Ordered FIFO tracking for processed observation events
+        # Using list + set to maintain insertion order while allowing fast lookup
+        self._processed_observation_ids_order: list[str] = []
+        self._processed_observation_ids_set: set[str] = set()
+        self._max_processed_observation_ids: int = 1000  # FIFO prune limit
 
     @property
     def event_cursor(self) -> str | None:
@@ -205,6 +213,7 @@ class Supervisor:
             logger.warning("Webhook registration failed; falling back to polling: %s", exc)
 
     async def _run_loop(self) -> None:
+        import time
         polls_since_checkpoint = 0
         while self.running:
             if self._poll_due_now():
@@ -217,6 +226,15 @@ class Supervisor:
                 await self._mark_exited_jobs()
             except Exception:
                 logger.exception("Error while inspecting job containers")
+
+            # 定时聚合 observation (ADR-0010 extension)
+            now = time.time()
+            if now - self._last_aggregation >= self.config.observation_aggregation_interval:
+                try:
+                    await self._aggregate_and_spawn_optimizer()
+                except Exception:
+                    logger.exception("Error in observation aggregation")
+                self._last_aggregation = now
 
             polls_since_checkpoint += 1
             if polls_since_checkpoint >= self._checkpoint_cycles:
@@ -1738,6 +1756,92 @@ class Supervisor:
             data.goal[:50] if data.goal else "",
         )
         await self._process_trigger(synthetic_event, data, replay=False)
+
+    async def _aggregate_and_spawn_optimizer(self) -> None:
+        """Aggregate observation events and spawn optimizer when thresholds exceeded.
+        
+        Per ADR-0010 extension for Factorio Tool Evolution MVP:
+        Periodically queries pasloe for observation.* events, aggregates by metric_type,
+        and spawns optimizer tasks when thresholds are exceeded.
+        
+        Deduplication strategy:
+        1. processed_ids tracks observation event IDs that have been aggregated
+        2. Each aggregation batch with new events gets a unique synthetic event id
+           (hash of new_ids), ensuring:
+           - Same observation batch won't trigger duplicate optimizer jobs
+           - New observation batch gets a new, independent job (won't reuse old job_id)
+        """
+        import hashlib
+        import time
+        from .observation_aggregator import aggregate_observations, AggregationResult
+        
+        results, new_ids = await aggregate_observations(
+            self.config.pasloe_url,
+            self.config.observation_window_hours,
+            self.config.observation_thresholds,
+            processed_ids=self._processed_observation_ids_set,
+        )
+        
+        # Record processed observation IDs with ordered FIFO tracking
+        # Add new IDs to both list (for order) and set (for fast lookup)
+        for id in new_ids:
+            if id not in self._processed_observation_ids_set:
+                self._processed_observation_ids_order.append(id)
+                self._processed_observation_ids_set.add(id)
+        
+        # Prune old IDs using true FIFO (remove oldest first)
+        while len(self._processed_observation_ids_order) > self._max_processed_observation_ids:
+            old_id = self._processed_observation_ids_order.pop(0)  # Remove oldest (FIFO)
+            self._processed_observation_ids_set.discard(old_id)
+        
+        for r in results:
+            if r.exceeded and new_ids:
+                # Spawn optimizer only when:
+                # 1. Window-wide count exceeds threshold
+                # 2. There are NEW events to process (dedup: don't re-spawn for same batch)
+                logger.info(
+                    f"Observation threshold exceeded: {r.metric_type} "
+                    f"(window_total={r.count} >= threshold={r.threshold}, new_events={len(new_ids)})"
+                )
+                # Compute unique hash from new_ids for this aggregation batch
+                # This ensures: same batch = same id (no duplicate), new batch = new id (new job)
+                batch_hash = hashlib.md5(json.dumps(sorted(new_ids)).encode()).hexdigest()[:8]
+                
+                # Construct TriggerData for optimizer
+                trigger_data = {
+                    "goal": f"Analyze {r.metric_type} pattern ({r.count} occurrences in {self.config.observation_window_hours}h window). Output a ReviewProposal JSON in your summary with executable_proposal for improvement.",
+                    "role": "optimizer",
+                    "team": "default",
+                    "budget": 0.5,
+                    "params": {
+                        "metric_type": r.metric_type,
+                        "observation_count": r.count,
+                        "window_hours": self.config.observation_window_hours,
+                    },
+                }
+                
+                # Create synthetic event with unique id per aggregation batch
+                # Hash ensures: same new_ids = same id (no duplicate spawn)
+                #              different new_ids = different id (new independent job)
+                synthetic_event = SimpleNamespace(
+                    id=f"obs-agg-{r.metric_type}-{batch_hash}",
+                    source_id="observation_aggregator",
+                    type="trigger",
+                    ts=datetime.now(timezone.utc),
+                    data=trigger_data,
+                )
+                
+                # Validate and process trigger
+                try:
+                    data = TriggerData.model_validate(trigger_data)
+                except Exception as e:
+                    logger.warning(
+                        "Aggregated observation trigger failed TriggerData validation: %s",
+                        e,
+                    )
+                    continue
+                
+                await self._process_trigger(synthetic_event, data, replay=False)
 
     @staticmethod
     def _event_idempotency_key(*, source_event_id: str, event_type: str, entity_id: str) -> str | None:

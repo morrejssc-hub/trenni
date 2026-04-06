@@ -130,6 +130,17 @@ class TrenniConfig:
     trenni_public_url: str = ""       # Override if not reachable at api_host:api_port
     webhook_poll_interval: float = 30.0  # Fallback poll interval when webhook active
 
+    # Observation aggregation config (ADR-0010 extension for autonomous optimization)
+    observation_aggregation_interval: float = 300.0  # 5 minutes
+    observation_window_hours: int = 24
+    observation_thresholds: dict[str, float] = field(default_factory=lambda: {
+        "budget_variance": 0.3,
+        "preparation_failure": 0.1,
+        "tool_retry": 0.2,
+        "tool_repetition": 5.0,  # Absolute count, not ratio
+        "context_late_lookup": 3.0,
+    })
+
     @property
     def trenni_webhook_url(self) -> str:
         base = self.trenni_public_url or f"http://{self.api_host}:{self.api_port}"
