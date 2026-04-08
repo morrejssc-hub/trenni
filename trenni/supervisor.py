@@ -1074,6 +1074,8 @@ class Supervisor:
         )
 
     async def _cleanup_handle(self, handle: JobHandle, *, failed: bool) -> None:
+        # TODO: debug - skip cleanup for now
+        return
         if failed and self.runtime_defaults.retain_on_failure:
             return
         try:
