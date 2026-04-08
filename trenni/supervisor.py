@@ -1515,7 +1515,7 @@ class Supervisor:
                 trigger_data = {
                     "goal": f"Analyze {r.metric_type} pattern ({r.count} occurrences in {self.config.observation_window_hours}h window). Output a ReviewProposal JSON in your summary with executable_proposal for improvement.",
                     "role": "optimizer",
-                    "bundle": "",
+                    "bundle": "default",  # Per Bundle MVP: optimizer uses default bundle
                     "budget": 0.5,
                     "params": {
                         "metric_type": r.metric_type,
