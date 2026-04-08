@@ -170,8 +170,9 @@ class RuntimeSpecBuilder:
 
         # Mount evo directory if evo_root is configured
         # Use evo_root_host for the host path (required for volume mounts from within container)
+        # RW mount for implementer writes (serialized via bundle max_concurrent_jobs=1)
         if self.config.evo_root and self.config.evo_root_host:
-            volume_mounts.append((self.config.evo_root_host, "/opt/yoitsu/palimpsest/evo", False))
+            volume_mounts.append((self.config.evo_root_host, "/opt/yoitsu/palimpsest/evo", True))
 
         # Factorio worker preparation syncs scripts into the live mod scripts directory.
         # When the path is passed only as an env var, writes would stay inside the job
