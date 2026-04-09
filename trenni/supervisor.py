@@ -439,6 +439,7 @@ class Supervisor:
             goal=data.goal,
             source_event_id=event.id,
             spec={"bundle": bundle, "budget": data.budget, "role": role},
+            eval_spec=data.eval_spec,
         )
         if task_id in self.state.tasks:
             self.state.tasks[task_id].bundle = bundle
