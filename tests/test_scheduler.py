@@ -144,7 +144,7 @@ def test_scheduler_enqueue_checks_bundle_capacity():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="factorio",
     )
 
@@ -164,7 +164,7 @@ def test_scheduler_enqueue_checks_bundle_capacity():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="factorio",
     )
 
@@ -197,7 +197,7 @@ def test_scheduler_enqueue_different_bundles_independent():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="factorio",
     )
     asyncio.run(scheduler.enqueue(job1))
@@ -212,7 +212,7 @@ def test_scheduler_enqueue_different_bundles_independent():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="default",
     )
 
@@ -241,7 +241,7 @@ def test_scheduler_resolve_pending_respects_bundle_capacity():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="factorio",
     )
     state.pending_jobs["job-1"] = job
@@ -277,7 +277,7 @@ def test_scheduler_resolve_pending_promotes_when_bundle_has_capacity():
         role="worker",
         repo="https://example.com/repo",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle="factorio",
     )
     state.pending_jobs["job-1"] = job

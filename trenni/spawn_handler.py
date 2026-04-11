@@ -61,7 +61,7 @@ class SpawnHandler:
             # Canonical fields only; no fallback to params
             repo = child.repo or self._inherit("repo", parent_job, parent_defaults, "")
             init_branch = child.init_branch or self._inherit("init_branch", parent_job, parent_defaults, "main")
-            evo_sha = child.sha or self._inherit("evo_sha", parent_job, parent_defaults, None)
+            bundle_sha = child.sha or self._inherit("bundle_sha", parent_job, parent_defaults, None)
             budget = child.budget
 
             # Validate budget against role's max_cost
@@ -84,7 +84,7 @@ class SpawnHandler:
                     role_params,
                     repo,
                     init_branch,
-                    evo_sha,
+                    bundle_sha,
                     bundle,
                     child.eval_spec,
                     budget,
@@ -103,16 +103,16 @@ class SpawnHandler:
                     "bundle": bundle,
                     "repo": repo,
                     "init_branch": init_branch,
-                    "evo_sha": evo_sha,
+                    "bundle_sha": bundle_sha,
                 },
                 bundle=bundle,
                 eval_spec=eval_spec,
             )
-            for task_id, _, goal, role, role_params, repo, init_branch, evo_sha, bundle, eval_spec, _ in child_defs
+            for task_id, _, goal, role, role_params, repo, init_branch, bundle_sha, bundle, eval_spec, _ in child_defs
         ]
 
         jobs: list[SpawnedJob] = []
-        for task_id, job_id, goal, role, role_params, repo, init_branch, evo_sha, bundle, _, budget in child_defs:
+        for task_id, job_id, goal, role, role_params, repo, init_branch, bundle_sha, bundle, _, budget in child_defs:
             sibling_ids = [candidate for candidate in child_task_ids if candidate != task_id]
             guard_conditions = []
 
@@ -149,7 +149,7 @@ class SpawnHandler:
                     role_params=role_params,
                     repo=repo,
                     init_branch=init_branch,
-                    evo_sha=evo_sha,
+                    bundle_sha=bundle_sha,
                     budget=budget or 0.0,
                     task_id=task_id,
                     condition=self._combine_conditions(guard_conditions),
@@ -176,7 +176,7 @@ class SpawnHandler:
                     role_params=join_role_params,
                     repo=parent_job.repo,
                     init_branch=parent_job.init_branch,
-                    evo_sha=parent_job.evo_sha,
+                    bundle_sha=parent_job.bundle_sha,
                     budget=parent_job.budget,
                     task_id=parent_job.task_id or payload.task_id or parent_job.job_id,
                     condition=self._join_condition(child_task_ids, wait_for),

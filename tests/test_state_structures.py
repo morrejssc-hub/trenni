@@ -50,7 +50,7 @@ def planner_role(**params):
             role="planner",
             repo="https://github.com/org/repo",
             init_branch="main",
-            evo_sha="abc123",
+            bundle_sha="abc123",
             budget=1.0,
             task_id="parent-task",
             bundle="default",
@@ -111,7 +111,7 @@ def implementer_role(**params):
             role="implementer",
             repo="https://github.com/org/repo",
             init_branch="main",
-            evo_sha="abc123",
+            bundle_sha="abc123",
             budget=1.0,
             task_id="parent-task",
             bundle="default",
@@ -147,7 +147,7 @@ def test_spawned_job_no_execution_overrides():
         role="implementer",
         repo="https://github.com/org/repo",
         init_branch="main",
-        evo_sha="abc123",
+        bundle_sha="abc123",
         task_id="task-1",
         bundle="default",
     )
@@ -166,7 +166,7 @@ def test_spawn_defaults_no_execution_overrides():
         repo="https://github.com/org/repo",
         init_branch="main",
         role="implementer",
-        evo_sha="abc123",
+        bundle_sha="abc123",
         bundle="default",
     )
     assert not hasattr(defaults, "llm_overrides")
@@ -185,7 +185,7 @@ def test_spawned_job_role_params_only_for_internal_flags():
         role="planner",
         repo="https://github.com/org/repo",
         init_branch="main",
-        evo_sha="abc123",
+        bundle_sha="abc123",
         role_params={"mode": "join"},  # role-internal flag, not task content
     )
     assert job.role_params == {"mode": "join"}
@@ -201,7 +201,7 @@ def test_spawn_defaults_role_params_only_for_internal_flags():
         repo="https://github.com/org/repo",
         init_branch="main",
         role="planner",
-        evo_sha="abc123",
+        bundle_sha="abc123",
         role_params={"mode": "join"},  # role-internal flag
         bundle="default",
     )

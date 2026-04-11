@@ -148,7 +148,7 @@ async def test_handle_spawn_creates_children_no_continuation():
         repo="/parent-repo",
         init_branch="main",
         role="default",
-        evo_sha="parent-sha",
+        bundle_sha="parent-sha",
         task_id="task-1",
     )
     event = _evt("spawn-1", "agent.job.spawn_request", {
@@ -193,7 +193,7 @@ def test_spawn_handler_join_job_uses_continuation_instruction():
         repo="/repo",
         init_branch="main",
         role="planner",
-        evo_sha="sha1",
+        bundle_sha="sha1",
         role_params={"goal": "Parent goal"},
         task_id="root-task",
     )
@@ -252,7 +252,7 @@ async def test_handle_event_deduplicates_spawn_request():
         repo="/parent-repo",
         init_branch="main",
         role="default",
-        evo_sha="parent-sha",
+        bundle_sha="parent-sha",
         task_id="task-1",
     )
     event = _evt("spawn-dup", "agent.job.spawn_request", {
@@ -277,7 +277,7 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_params_fields()
         repo="/parent-repo",
         init_branch="parent-branch",
         role="parent-role",
-        evo_sha="parent-sha",
+        bundle_sha="parent-sha",
         task_id="task-1",
     )
     event = _evt("spawn-inherit", "agent.job.spawn_request", {
@@ -294,7 +294,7 @@ async def test_handle_spawn_inherits_parent_defaults_for_missing_params_fields()
     assert child.role == "worker"
     assert child.repo == "/parent-repo"
     assert child.init_branch == "parent-branch"
-    assert child.evo_sha == "parent-sha"
+    assert child.bundle_sha == "parent-sha"
     assert child.bundle == "factorio"
     # Per ADR-0007: no execution config overrides inherited
     assert child.budget == 0.0
@@ -771,7 +771,7 @@ async def test_checkpoint_reaps_timed_out_containers():
     sup.state.tasks["t1"] = TaskRecord(task_id="t1", goal="...", bundle="factorio")
     sup.state.jobs_by_id["j1"] = SpawnedJob(
         job_id="j1", source_event_id="e1", goal="t", role="default",
-        repo="r", init_branch="b", evo_sha="s", task_id="t1", bundle="factorio"
+        repo="r", init_branch="b", bundle_sha="s", task_id="t1", bundle="factorio"
     )
     handle = JobHandle(
         "j1",
@@ -852,7 +852,7 @@ async def test_replay_enqueues_not_launched():
                 "bundle": "factorio",
                 "repo": "/r",
                 "init_branch": "main",
-                "evo_sha": "",
+                "bundle_sha": "",
                 "budget": 1.0,
                 "parent_job_id": "",
                 "condition": None,
@@ -884,7 +884,7 @@ async def test_replay_skips_completed():
                 "bundle": "factorio",
                 "repo": "/r",
                 "init_branch": "main",
-                "evo_sha": "",
+                "bundle_sha": "",
                 "budget": 1.0,
                 "parent_job_id": "",
                 "condition": None,
@@ -929,7 +929,7 @@ async def test_replay_reenqueues_missing_container():
                 "bundle": "factorio",
                 "repo": "/r",
                 "init_branch": "main",
-                "evo_sha": "",
+                "bundle_sha": "",
                 "budget": 1.0,
                 "parent_job_id": "",
                 "condition": None,
@@ -972,7 +972,7 @@ async def test_replay_reattaches_running_container():
                 "bundle": "factorio",
                 "repo": "/r",
                 "init_branch": "main",
-                "evo_sha": "",
+                "bundle_sha": "",
                 "budget": 1.0,
                 "parent_job_id": "",
                 "condition": None,

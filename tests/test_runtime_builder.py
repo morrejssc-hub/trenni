@@ -63,7 +63,7 @@ def test_runtime_spec_builder_uses_bundle_config():
         bundle="factorio",
         repo="https://github.com/test/repo.git",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
     )
 
     # Assert: team runtime values override defaults
@@ -116,7 +116,7 @@ def test_runtime_spec_builder_bundle_missing_image_uses_default():
         bundle="minimal",
         repo="https://github.com/test/repo.git",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
     )
 
     # Assert: default image used when team has no override
@@ -162,7 +162,7 @@ def test_runtime_spec_builder_bundle_none_pod_name_means_no_pod():
         bundle="no-pod-team",
         repo="https://github.com/test/repo.git",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
     )
 
     # Assert: None pod_name means no pod
@@ -206,7 +206,7 @@ def test_runtime_spec_builder_unknown_bundle_uses_defaults():
         bundle="unknown-team",
         repo="https://github.com/test/repo.git",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
     )
 
     # Assert: all defaults used for unknown team
@@ -222,8 +222,8 @@ def test_runtime_spec_builder_mounts_factorio_mod_scripts_dir_rw(monkeypatch: py
 
     config = TrenniConfig(
         runtime=TrenniConfig.__dataclass_fields__['runtime'].default_factory(),
-        evo_root="/workspace/evo",
-        evo_root_host="/home/holo/yoitsu/evo",
+        bundle_root="/workspace/evo",
+        bundle_root_host="/home/holo/yoitsu/evo",
         bundles={
             "factorio": BundleConfig(
                 runtime=BundleRuntimeConfig(
@@ -272,7 +272,7 @@ def test_runtime_spec_builder_mounts_factorio_mod_scripts_dir_rw(monkeypatch: py
         bundle="factorio",
         repo="",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         bundle_source=bundle_source,
         target_source=target_source,
     )

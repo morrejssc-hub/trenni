@@ -64,7 +64,7 @@ class RuntimeSpecBuilder:
         bundle: str = "",
         repo: str,
         init_branch: str,
-        evo_sha: str | None,
+        bundle_sha: str | None,
         budget: float | None = None,
         job_context: JobContextConfig | None = None,
         input_artifacts: list[ArtifactBinding] | None = None,  # ADR-0013
@@ -99,7 +99,7 @@ class RuntimeSpecBuilder:
                 "job_id": job_id,
                 "task_id": task_id or job_id,
                 "goal": goal,
-                "evo_sha": evo_sha or "",
+                "bundle_sha": bundle_sha or "",
                 "role": role,
                 "role_params": dict(role_params or {}),
                 "bundle": bundle,
@@ -129,7 +129,7 @@ class RuntimeSpecBuilder:
             "io.yoitsu.job-id": job_id,
             "io.yoitsu.source-event-id": source_event_id,
             "io.yoitsu.runtime": self.defaults.kind,
-            "io.yoitsu.evo-sha": evo_sha or "",
+            "io.yoitsu.bundle-sha": bundle_sha or "",
         }
 
         # Get bundle runtime config and merge with defaults per ADR-0011 D4

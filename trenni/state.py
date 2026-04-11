@@ -30,7 +30,7 @@ class SpawnedJob:
         role: Role type to execute this task.
         repo: Repository URL.
         init_branch: Starting branch.
-        evo_sha: Git SHA for evo version.
+        bundle_sha: Bundle repo commit SHA (12-char prefix).
         budget: Maximum cost for this task (task semantics field).
         role_params: Role-internal behavior flags only (e.g. mode="join").
         depends_on: Job IDs this job waits for.
@@ -48,7 +48,7 @@ class SpawnedJob:
     role: str
     repo: str
     init_branch: str
-    evo_sha: str | None
+    bundle_sha: str | None
     budget: float = 0.0
     role_params: dict[str, Any] = field(default_factory=dict)
     depends_on: frozenset[str] = field(default_factory=frozenset)
@@ -72,7 +72,7 @@ class SpawnedJob:
             "bundle": self.bundle,
             "repo": self.repo,
             "init_branch": self.init_branch,
-            "evo_sha": self.evo_sha or "",
+            "bundle_sha": self.bundle_sha or "",
             "budget": self.budget,
             "parent_job_id": self.parent_job_id,
             "condition": condition_data,
@@ -94,7 +94,7 @@ class SpawnedJob:
             "bundle": self.bundle,
             "repo": self.repo,
             "init_branch": self.init_branch,
-            "evo_sha": self.evo_sha or "",
+            "bundle_sha": self.bundle_sha or "",
             "budget": self.budget,
             "runtime_kind": runtime_kind,
             "container_id": container_id,
@@ -120,7 +120,7 @@ class SpawnedJob:
             bundle=data.get("bundle", ""),
             repo=data["repo"],
             init_branch=data["init_branch"],
-            evo_sha=data.get("evo_sha") or None,
+            bundle_sha=data.get("bundle_sha") or None,
             budget=data.get("budget", 0.0),
             task_id=data.get("task_id") or data["job_id"],
             condition=condition_from_data(data.get("condition")),
@@ -145,7 +145,7 @@ class SpawnDefaults:
     repo: str
     init_branch: str
     role: str
-    evo_sha: str | None
+    bundle_sha: str | None
     role_params: dict[str, Any] = field(default_factory=dict)  # only role-internal flags
     task_id: str = ""
     bundle: str = ""

@@ -80,7 +80,7 @@ class TestRuntimeSpecBuilderPodNameInheritance:
             role="worker",
             repo="test/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="my-bundle",
         )
 
@@ -104,7 +104,7 @@ class TestRuntimeSpecBuilderPodNameInheritance:
             role="worker",
             repo="test/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="my-bundle",
         )
 
@@ -128,7 +128,7 @@ class TestRuntimeSpecBuilderPodNameInheritance:
             role="worker",
             repo="test/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="my-bundle",
         )
 
@@ -147,7 +147,7 @@ class TestRuntimeSpecBuilderPodNameInheritance:
             role="worker",
             repo="test/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="unknown-team",
         )
 
@@ -174,7 +174,7 @@ class TestRuntimeSpecBuilderPodNameInheritance:
             role="worker",
             repo="test/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="my-bundle",
         )
 

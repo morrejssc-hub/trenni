@@ -31,7 +31,7 @@ def test_input_artifacts_propagated_to_runtime_spec():
         role="default",
         repo="https://github.com/example/repo.git",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         budget=1.0,
         input_artifacts=[binding],
     )
@@ -48,7 +48,7 @@ def test_input_artifacts_propagated_to_runtime_spec():
         role=job.role,
         repo=job.repo,
         init_branch=job.init_branch,
-        evo_sha=job.evo_sha,
+        bundle_sha=job.bundle_sha,
         budget=job.budget,
         input_artifacts=job.input_artifacts,
     )
@@ -90,7 +90,7 @@ def test_spawned_job_serialization_preserves_input_artifacts():
         role="default",
         repo="",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         input_artifacts=[binding],
     )
 
@@ -124,7 +124,7 @@ def test_spawned_job_launched_data_includes_input_artifacts():
         role="default",
         repo="",
         init_branch="main",
-        evo_sha=None,
+        bundle_sha=None,
         input_artifacts=[binding],
     )
 
@@ -167,7 +167,7 @@ def test_trigger_data_input_artifacts_to_spawned_job():
         role=trigger.role,
         repo=trigger.repo,
         init_branch=trigger.init_branch or "main",
-        evo_sha=trigger.sha,
+        bundle_sha=trigger.sha,
         budget=trigger.budget,
         task_id="test-task",
         bundle=trigger.bundle,
@@ -215,7 +215,7 @@ def test_launched_event_replay_preserves_input_artifacts():
         bundle=event_data.get("bundle", ""),
         repo=event_data.get("repo", ""),
         init_branch=event_data.get("init_branch", "main"),
-        evo_sha=event_data.get("evo_sha") or None,
+        bundle_sha=event_data.get("bundle_sha") or None,
         budget=event_data.get("budget", 0.0),
         task_id=event_data.get("task_id", "") or event_data.get("job_id", ""),
         parent_job_id=event_data.get("parent_job_id", ""),

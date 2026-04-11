@@ -90,7 +90,7 @@ def test_runtime_spec_builder_serializes_job_config(monkeypatch):
         role="default",
         repo="git@example.com/repo.git",
         init_branch="main",
-        evo_sha="abc123",
+        bundle_sha="abc123",
         budget=0.75,  # single-channel budget per ADR-0007
     )
 

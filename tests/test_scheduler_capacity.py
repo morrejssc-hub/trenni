@@ -43,7 +43,7 @@ class TestStrictBundleCapacityAtLaunch:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
         job2 = SpawnedJob(
@@ -53,7 +53,7 @@ class TestStrictBundleCapacityAtLaunch:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 
@@ -95,7 +95,7 @@ class TestStrictBundleCapacityAtLaunch:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 
@@ -189,7 +189,7 @@ class TestDrainQueueBundleCapacity:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
         job2 = SpawnedJob(
@@ -199,7 +199,7 @@ class TestDrainQueueBundleCapacity:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 
@@ -269,7 +269,7 @@ class TestBundleCapacityWithPendingPromotion:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 
@@ -297,7 +297,7 @@ class TestBundleCapacityWithPendingPromotion:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 
@@ -324,7 +324,7 @@ class TestBundleCapacityWithPendingPromotion:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
         job2 = SpawnedJob(
@@ -334,7 +334,7 @@ class TestBundleCapacityWithPendingPromotion:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
         job3 = SpawnedJob(
@@ -344,7 +344,7 @@ class TestBundleCapacityWithPendingPromotion:
             role="worker",
             repo="https://example.com/repo",
             init_branch="main",
-            evo_sha=None,
+            bundle_sha=None,
             bundle="factorio",
         )
 

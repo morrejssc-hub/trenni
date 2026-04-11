@@ -107,7 +107,7 @@ class Supervisor:
         # Role catalog with SHA-based invalidation per ADR-0007
         self._role_catalog_cache: dict[str, dict[str, Any]] | None = None
         self._role_metadata_reader: RoleMetadataReader | None = None
-        self._cached_evo_sha: str | None = None
+        self._cached_bundle_sha: str | None = None
         
         # Observation aggregation state (ADR-0010 extension)
         self._last_aggregation: float = 0.0
@@ -324,7 +324,7 @@ class Supervisor:
             bundle=job.bundle,
             repo=job.repo,
             init_branch=job.init_branch,
-            evo_sha=job.evo_sha,
+            bundle_sha=job.bundle_sha,
             budget=job.budget,
             source_event_id=job.source_event_id,
             job_context=job.job_context,
@@ -499,7 +499,7 @@ class Supervisor:
 
         repo = data.repo
         init_branch = data.init_branch or "main"
-        evo_sha = data.sha
+        bundle_sha = data.sha
 
         root_job = SpawnedJob(
             job_id=root_job_id,
@@ -509,7 +509,7 @@ class Supervisor:
             role_params=role_params,
             repo=repo,
             init_branch=init_branch,
-            evo_sha=evo_sha,
+            bundle_sha=bundle_sha,
             budget=data.budget,
             task_id=task_id,
             bundle=bundle,
@@ -1032,7 +1032,7 @@ class Supervisor:
         role: str,
         repo: str,
         init_branch: str,
-        evo_sha: str | None,
+        bundle_sha: str | None,
         budget: float | None = None,
         source_event_id: str = "",
         task_id: str = "",
@@ -1052,7 +1052,7 @@ class Supervisor:
             bundle=bundle,
             repo=repo,
             init_branch=init_branch,
-            bundle_sha=evo_sha,  # Bundle SHA from trigger/spawn
+            bundle_sha=bundle_sha,  # Bundle SHA from trigger/spawn
         )
         
         # Track temp dirs for cleanup
@@ -1068,7 +1068,7 @@ class Supervisor:
             bundle=bundle,
             repo=repo,
             init_branch=init_branch,
-            evo_sha=evo_sha,
+            bundle_sha=bundle_sha,
             budget=budget,
             job_context=job_context,
             input_artifacts=input_artifacts,  # ADR-0013
@@ -1097,7 +1097,7 @@ class Supervisor:
             bundle=bundle,
             repo=repo,
             init_branch=init_branch,
-            evo_sha=evo_sha,
+            bundle_sha=bundle_sha,
             budget=budget or 0.0,
             task_id=task_id or job_id,
             condition=condition,
@@ -1115,7 +1115,7 @@ class Supervisor:
             role=role,
             role_params=dict(role_params or {}),
             bundle=bundle,
-            evo_sha=evo_sha,
+            bundle_sha=bundle_sha,
             task_id=task_id or job_id,
             budget=budget or 0.0,  # ADR-0010: for budget_variance observation
         )
@@ -1213,18 +1213,18 @@ class Supervisor:
         ref = container_id or container_name or f"yoitsu-job-{job_id}"
         return JobHandle(job_id=job_id, container_id=container_id or ref, container_name=container_name or ref)
 
-    def _evo_root(self) -> Path:
-        """Get the evo root directory."""
-        if self.config.evo_root:
-            return Path(self.config.evo_root)
-        return Path(__file__).resolve().parents[2] / "palimpsest" / "evo"
+    def _bundle_root(self) -> Path:
+        """Get the bundle root directory."""
+        if self.config.bundle_root:
+            return Path(self.config.bundle_root)
+        return Path(__file__).resolve().parents[2] / "palimpsest" / "bundle"
 
-    def _read_evo_sha(self) -> str:
-        """Read current HEAD SHA from evo root for cache invalidation."""
-        evo_root = self._evo_root()
+    def _read_bundle_sha(self) -> str:
+        """Read current HEAD SHA from bundle root for cache invalidation."""
+        bundle_root = self._bundle_root()
         try:
             result = subprocess.run(
-                ["git", "-C", str(evo_root), "rev-parse", "HEAD"],
+                ["git", "-C", str(bundle_root), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -1280,7 +1280,7 @@ class Supervisor:
             bundle=data.get("bundle", ""),
             repo=data.get("repo", ""),
             init_branch=data.get("init_branch", "main"),
-            evo_sha=data.get("evo_sha") or None,
+            bundle_sha=data.get("bundle_sha") or None,
             budget=data.get("budget", 0.0),
             task_id=data.get("task_id", "") or job_id,
             condition=condition_from_data(data.get("condition")),
@@ -1292,7 +1292,7 @@ class Supervisor:
             repo=data.get("repo", ""),
             init_branch=data.get("init_branch", "main"),
             role=data.get("role", "default"),
-            evo_sha=data.get("evo_sha") or None,
+            bundle_sha=data.get("bundle_sha") or None,
             task_id=data.get("task_id", "") or job_id,
             bundle=data.get("bundle", ""),
             budget=data.get("budget", 0.0),
@@ -1369,7 +1369,7 @@ class Supervisor:
             bundle=task.bundle,
             repo=base_job.repo if base_job else "",
             init_branch=eval_branch,
-            evo_sha=base_job.evo_sha if base_job else None,
+            bundle_sha=base_job.bundle_sha if base_job else None,
             task_id=task.task_id,
             parent_job_id=base_job.parent_job_id if base_job else "",
             job_context=JobContextConfig(

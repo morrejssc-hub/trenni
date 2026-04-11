@@ -139,8 +139,8 @@ class TrenniConfig:
     pasloe_url: str = "http://localhost:8000"
     pasloe_api_key_env: str = "PASLOE_API_KEY"
     source_id: str = "trenni-supervisor"
-    evo_root: str = ""
-    evo_root_host: str = ""  # Host path for volume mounts (when running in container)
+    bundle_root: str = ""
+    bundle_root_host: str = ""  # Host path for volume mounts (when running in container)
 
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     bundles: dict[str, BundleConfig] = field(default_factory=dict)
