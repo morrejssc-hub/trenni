@@ -92,7 +92,7 @@ class WorkspaceManager:
                 temp_dirs.append(target_ws)
                 target_source = TargetSource(
                     repo_uri=repo,
-                    branch=init_branch,
+                    selector=init_branch,
                     workspace=str(target_ws),
                 )
         
