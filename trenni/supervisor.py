@@ -1745,21 +1745,29 @@ class Supervisor:
         
         Queries agent.tool.exec and agent.tool.result events.
         """
+        import os
         events = []
+        api_key = os.environ.get(self.config.pasloe_api_key_env, "")
         
-        # Query tool.exec events
+        # Query tool.exec events via HTTP
+        import httpx
+        headers = {"X-API-Key": api_key} if api_key else {}
+        
         try:
-            exec_events = await self.client.poll(
-                type_="agent.tool.exec",
-                limit=100,
-            )
-            for evt in exec_events:
-                if evt.data.get("job_id") == job_id:
-                    events.append({
-                        "type": "agent.tool.exec",
-                        "ts": evt.ts.isoformat() if hasattr(evt, 'ts') else evt.get("ts", ""),
-                        "data": evt.data if hasattr(evt, 'data') else evt.get("data", {}),
-                    })
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.config.pasloe_url}/events",
+                    params={"type": "agent.tool.exec", "limit": 100},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                for evt in resp.json():
+                    if evt.get("data", {}).get("job_id") == job_id:
+                        events.append({
+                            "type": evt.get("type", ""),
+                            "ts": evt.get("ts", ""),
+                            "data": evt.get("data", {}),
+                        })
         except Exception as e:
             logger.warning("Failed to fetch tool.exec events: %s", e)
         
