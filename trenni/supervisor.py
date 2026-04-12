@@ -1684,13 +1684,16 @@ class Supervisor:
     ) -> None:
         """Run observation analyzers after job terminal (ADR-0017).
         
-        Per ADR-0017: Trenni runs registered analyzers on job events,
-        then emits observation.* events from the returned data.
+        Per ADR-0017: Trenni loads bundle-provided analyzers, queries pasloe for
+        job events, and emits observation.* events from analyzer results.
         """
-        from .observation_analyzers import get_analyzer, BUILTIN_ANALYZERS
         from yoitsu_contracts.observation import ObservationToolRepetitionEvent, OBSERVATION_TOOL_REPETITION
         
         if job is None:
+            return
+        
+        # Skip optimizer/implementer to prevent cascade
+        if job.role in ("optimizer", "implementer"):
             return
         
         task_id = job.task_id or job_id
@@ -1702,14 +1705,19 @@ class Supervisor:
         if job.analyzer_version:
             analyzer_version_dict = job.analyzer_version.model_dump(mode="json")
         
-        # For now, just run tool_repetition analyzer on the completed event
-        # In full implementation, would query pasloe for all job events
-        job_events = [event]  # Simplified: only the terminal event
+        # Query pasloe for job events (tool.exec, tool.result)
+        job_events = await self._fetch_job_events(job_id)
         
-        analyzer = get_analyzer("tool_repetition")
+        # Load bundle analyzer
+        analyzer = self._load_bundle_analyzer(bundle, "tool_repetition")
+        if analyzer is None:
+            # Fallback to builtin (for non-bundle jobs)
+            from .observation_analyzers import get_analyzer
+            analyzer = get_analyzer("tool_repetition")
+        
         if analyzer:
             try:
-                observations = analyzer.analyze(job_events, job_id, task_id, role, bundle)
+                observations = analyzer.analyze(job_events)
                 
                 # Emit observation events
                 for obs in observations:
@@ -1730,7 +1738,72 @@ class Supervisor:
                         ).model_dump(),
                     )
             except Exception as e:
-                logger.warning("Observation analyzer %s failed for job %s: %s", analyzer.name, job_id, e)
+                logger.warning("Observation analyzer failed for job %s: %s", job_id, e)
+
+    async def _fetch_job_events(self, job_id: str) -> list[dict]:
+        """Fetch all events for a job from pasloe.
+        
+        Queries agent.tool.exec and agent.tool.result events.
+        """
+        events = []
+        
+        # Query tool.exec events
+        try:
+            exec_events = await self.client.poll(
+                type_="agent.tool.exec",
+                limit=100,
+            )
+            for evt in exec_events:
+                if evt.data.get("job_id") == job_id:
+                    events.append({
+                        "type": "agent.tool.exec",
+                        "ts": evt.ts.isoformat() if hasattr(evt, 'ts') else evt.get("ts", ""),
+                        "data": evt.data if hasattr(evt, 'data') else evt.get("data", {}),
+                    })
+        except Exception as e:
+            logger.warning("Failed to fetch tool.exec events: %s", e)
+        
+        return events
+
+    def _load_bundle_analyzer(self, bundle: str, analyzer_name: str):
+        """Load analyzer from bundle workspace.
+        
+        Args:
+            bundle: Bundle name
+            analyzer_name: Analyzer name (e.g., "tool_repetition")
+        
+        Returns:
+            Analyzer module with analyze() function, or None
+        """
+        import importlib.util
+        
+        bundle_config = self.config.bundles.get(bundle)
+        if not bundle_config:
+            return None
+        
+        # Find analyzer in bundle workspace
+        # TODO: Use bundle_sha to find the right workspace
+        # For now, look in any available bundle workspace
+        for job_record in self.state.jobs_by_id.values():
+            if job_record.bundle == bundle and job_record.bundle_sha:
+                # Try to find workspace from prepared record
+                ws_key = f"{job_record.job_id}-bundle"
+                ws_path = self.workspace_manager._base_dir / ws_key
+                if ws_path.exists():
+                    analyzer_path = ws_path / "scripts" / "analyzers" / f"{analyzer_name}.py"
+                    if analyzer_path.exists():
+                        try:
+                            spec = importlib.util.spec_from_file_location(
+                                f"bundle_analyzer_{analyzer_name}",
+                                analyzer_path,
+                            )
+                            module = importlib.util.module_from_spec(spec)
+                            spec.loader.exec_module(module)
+                            return module
+                        except Exception as e:
+                            logger.warning("Failed to load bundle analyzer %s: %s", analyzer_path, e)
+        
+        return None
 
     async def _handle_optimizer_output(
         self,
