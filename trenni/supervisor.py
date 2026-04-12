@@ -1757,7 +1757,7 @@ class Supervisor:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     f"{self.config.pasloe_url}/events",
-                    params={"type": "agent.tool.exec", "limit": 100},
+                    params={"type": "agent.tool.exec", "limit": 100, "order": "desc"},
                     headers=headers,
                 )
                 resp.raise_for_status()

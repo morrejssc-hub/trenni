@@ -47,87 +47,43 @@ class ToolRepetitionAnalyzer:
     """
     name = "tool_repetition"
     
-    def analyze(self, job_events: list[Event], job_id: str, task_id: str, role: str, bundle: str) -> list[dict[str, Any]]:
-        """Analyze tool call history from job.completed event.
+    def analyze(self, job_events: list[dict]) -> list[dict[str, Any]]:
+        """Analyze tool call history from job events.
         
         Args:
-            job_events: Events from this job (includes job.completed with tool_call_history)
-            
+            job_events: List of events for this job (from pasloe query)
+                - agent.tool.exec: {tool_name, arguments_preview, job_id}
+                - agent.job.completed: {summary, status}
+        
         Returns:
-            List of tool repetition observations
+            List of observation data dicts (will be emitted as observation.* events)
         """
-        # Find job.completed event with tool_call_history
-        # PasloeEvent is a dataclass with .type and .data attributes
-        completed_event = None
-        for evt in job_events:
-            # Handle both dict (replay) and PasloeEvent dataclass (realtime)
-            evt_type = evt.type if hasattr(evt, 'type') else evt.get('type', '')
-            if evt_type == "agent.job.completed":
-                completed_event = evt
-                break
+        # Extract tool.exec events
+        tool_execs = [
+            evt for evt in job_events
+            if evt.get("type") == "agent.tool.exec"
+        ]
         
-        if not completed_event:
+        if not tool_execs:
             return []
         
-        # Handle both dict and PasloeEvent dataclass
-        if hasattr(completed_event, 'data'):
-            tool_call_history = completed_event.data.get('tool_call_history', [])
-        else:
-            tool_call_history = completed_event.get('data', {}).get('tool_call_history', [])
-        if not tool_call_history:
-            return []
-        
-        # Detect repetition patterns
-        # Import is inside try block because palimpsest is not available in trenni container
-        try:
-            from palimpsest.runtime.tool_pattern import detect_repetition
-            repetitions = detect_repetition(tool_call_history)
-        except Exception:
-            # If detect_repetition not available, use simple detection
-            repetitions = self._simple_detect(tool_call_history)
-        
-        results = []
-        for r in repetitions:
-            results.append({
-                "tool_name": r.tool_name,
-                "call_count": r.call_count,
-                "arg_pattern": r.arg_pattern,
-                "similarity": r.similarity,
-            })
-        
-        return results
-    
-    def _simple_detect(self, tool_call_history: list[dict]) -> list[Any]:
-        """Simple repetition detection fallback.
-        
-        Detects tools called more than threshold times.
-        """
-        from dataclasses import dataclass
-        
-        @dataclass
-        class Repetition:
-            tool_name: str
-            call_count: int
-            arg_pattern: str
-            similarity: float
-        
-        threshold = 5
+        # Group by tool_name, count calls
         tool_counts: dict[str, int] = {}
-        
-        for call in tool_call_history:
-            tool_name = call.get("name", call.get("tool_name", ""))
+        for evt in tool_execs:
+            tool_name = evt.get("data", {}).get("tool_name", "")
             if tool_name:
                 tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
         
+        # Build results for tools called >= 5 times
         results = []
         for tool_name, count in tool_counts.items():
-            if count >= threshold:
-                results.append(Repetition(
-                    tool_name=tool_name,
-                    call_count=count,
-                    arg_pattern="",  # Simple detection doesn't analyze args
-                    similarity=0.0,
-                ))
+            if count >= 5:
+                results.append({
+                    "tool_name": tool_name,
+                    "call_count": count,
+                    "arg_pattern": "",  # Builtin analyzer doesn't analyze args
+                    "similarity": 0.0,
+                })
         
         return results
 
