@@ -1775,6 +1775,16 @@ class Supervisor:
         # Bundle MVP: inherit bundle from parent job if not specified in proposal
         if not trigger_data.get("bundle") and job.bundle:
             trigger_data["bundle"] = job.bundle
+        
+        # ADR-0015: implementer writes to bundle repo, set repo=bundle_repo_url
+        # This enables WorkspaceManager to create target_source for implementer
+        if trigger_data.get("role") == "implementer":
+            bundle_name = trigger_data.get("bundle", "")
+            bundle_config = self.config.bundles.get(bundle_name)
+            if bundle_config and bundle_config.source.url:
+                # Set repo and init_branch so implementer has a target workspace
+                trigger_data["repo"] = bundle_config.source.url
+                trigger_data["init_branch"] = bundle_config.source.selector
 
         # Create synthetic event for _process_trigger
         proposal_source_event_id = f"{event.id}-proposal"
