@@ -88,11 +88,11 @@ async def test_aggregate_below_threshold(sample_events):
         )
     
     assert len(results) == 1
-    assert results[0].metric_type == "tool_repetition"
+    assert results[0].metric_type == "tool_repetition:factorio_call_script(actions.place)"
     assert results[0].count == 1
     assert not results[0].exceeded
-    assert "tool_repetition" in new_ids
-    assert new_ids["tool_repetition"] == ["evt-1"]
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids
+    assert new_ids["tool_repetition:factorio_call_script(actions.place)"] == ["evt-1"]
 
 
 @pytest.mark.asyncio
@@ -113,11 +113,11 @@ async def test_aggregate_exceeds_threshold(sample_events):
         )
     
     assert len(results) == 1
-    assert results[0].metric_type == "tool_repetition"
+    assert results[0].metric_type == "tool_repetition:factorio_call_script(actions.place)"
     assert results[0].count == 2
     assert results[0].exceeded
-    assert "tool_repetition" in new_ids
-    assert set(new_ids["tool_repetition"]) == {"evt-1", "evt-2"}
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids
+    assert set(new_ids["tool_repetition:factorio_call_script(actions.place)"]) == {"evt-1", "evt-2"}
 
 
 @pytest.mark.asyncio
@@ -138,17 +138,17 @@ async def test_aggregate_multiple_metric_types(sample_events):
     assert len(results) == 2
     metrics = {r.metric_type: r for r in results}
     
-    assert "tool_repetition" in metrics
-    assert metrics["tool_repetition"].count == 2
-    assert metrics["tool_repetition"].exceeded
+    assert "tool_repetition:factorio_call_script(actions.place)" in metrics
+    assert metrics["tool_repetition:factorio_call_script(actions.place)"].count == 2
+    assert metrics["tool_repetition:factorio_call_script(actions.place)"].exceeded
     
     assert "budget_variance" in metrics
     assert metrics["budget_variance"].count == 1
     assert metrics["budget_variance"].exceeded
     
-    assert "tool_repetition" in new_ids
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids
     assert "budget_variance" in new_ids
-    assert set(new_ids["tool_repetition"]) == {"evt-1", "evt-2"}
+    assert set(new_ids["tool_repetition:factorio_call_script(actions.place)"]) == {"evt-1", "evt-2"}
     assert set(new_ids["budget_variance"]) == {"evt-3"}
 
 
@@ -201,8 +201,8 @@ async def test_aggregate_pagination():
     assert len(results) == 1
     assert results[0].count == 2
     assert call_count == 2
-    assert "tool_repetition" in new_ids
-    assert set(new_ids["tool_repetition"]) == {"evt-1", "evt-2"}
+    assert "tool_repetition:unknown" in new_ids
+    assert set(new_ids["tool_repetition:unknown"]) == {"evt-1", "evt-2"}
 
 
 @pytest.mark.asyncio
@@ -227,12 +227,12 @@ async def test_aggregate_filters_non_observation_events(sample_events):
     
     assert len(results) == 2
     metrics = {r.metric_type: r for r in results}
-    assert "tool_repetition" in metrics
+    assert "tool_repetition:factorio_call_script(actions.place)" in metrics
     assert "budget_variance" in metrics
     assert "tool.exec" not in metrics
-    assert "tool_repetition" in new_ids
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids
     assert "budget_variance" in new_ids
-    assert set(new_ids["tool_repetition"]) == {"evt-1", "evt-2"}
+    assert set(new_ids["tool_repetition:factorio_call_script(actions.place)"]) == {"evt-1", "evt-2"}
     assert set(new_ids["budget_variance"]) == {"evt-3"}
 
 
@@ -283,10 +283,10 @@ async def test_aggregate_skips_processed_ids(sample_events):
         )
     
     assert results1[0].count == 2
-    assert "tool_repetition" in new_ids1
-    assert set(new_ids1["tool_repetition"]) == {"evt-1", "evt-2"}
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids1
+    assert set(new_ids1["tool_repetition:factorio_call_script(actions.place)"]) == {"evt-1", "evt-2"}
     
-    processed_ids = set(new_ids1["tool_repetition"])
+    processed_ids = set(new_ids1["tool_repetition:factorio_call_script(actions.place)"])
     with patch("httpx.AsyncClient", return_value=mock_client):
         results2, new_ids2 = await aggregate_observations(
             "http://localhost:8000",
@@ -298,7 +298,7 @@ async def test_aggregate_skips_processed_ids(sample_events):
     assert len(results2) == 1
     assert results2[0].count == 2
     assert results2[0].exceeded
-    assert "tool_repetition" not in new_ids2  # All IDs processed
+    assert "tool_repetition:factorio_call_script(actions.place)" not in new_ids2  # All IDs processed
 
 
 @pytest.mark.asyncio
@@ -327,11 +327,19 @@ async def test_aggregate_partial_processed_ids(sample_events):
             processed_ids=processed_ids,
         )
     
-    assert len(results) == 1
-    assert results[0].count == 3
-    assert results[0].exceeded
-    assert "tool_repetition" in new_ids
-    assert set(new_ids["tool_repetition"]) == {"evt-2", "evt-3"}
+    assert len(results) == 2
+    # factorio_call_script has count=2 (from sample_events evt-1, evt-2)
+    factorio_result = [r for r in results if r.metric_type == "tool_repetition:factorio_call_script(actions.place)"][0]
+    assert factorio_result.count == 2
+    assert factorio_result.exceeded
+    # unknown has count=1 (from evt-3 added without tool_name)
+    unknown_result = [r for r in results if r.metric_type == "tool_repetition:unknown"][0]
+    assert unknown_result.count == 1
+    assert not unknown_result.exceeded
+    assert "tool_repetition:factorio_call_script(actions.place)" in new_ids
+    assert set(new_ids["tool_repetition:factorio_call_script(actions.place)"]) == {"evt-2"}
+    assert "tool_repetition:unknown" in new_ids
+    assert new_ids["tool_repetition:unknown"] == ["evt-3"]
 
 
 @pytest.mark.asyncio
@@ -415,8 +423,8 @@ async def test_window_count_semantics_for_threshold():
     
     assert results1[0].count == 3
     assert not results1[0].exceeded
-    assert "tool_repetition" in new_ids1
-    assert set(new_ids1["tool_repetition"]) == {"evt-1", "evt-2", "evt-3"}
+    assert "tool_repetition:unknown" in new_ids1
+    assert set(new_ids1["tool_repetition:unknown"]) == {"evt-1", "evt-2", "evt-3"}
     
     round2_events = round1_events + [
         {"id": "evt-4", "type": "observation.tool_repetition", "ts": "2024-01-01T00:03:00Z", "data": {}},
@@ -425,7 +433,7 @@ async def test_window_count_semantics_for_threshold():
     ]
     
     mock_client.get = AsyncMock(return_value=make_response(round2_events))
-    processed_ids = set(new_ids1["tool_repetition"])
+    processed_ids = set(new_ids1["tool_repetition:unknown"])
     
     with patch("httpx.AsyncClient", return_value=mock_client):
         results2, new_ids2 = await aggregate_observations(
@@ -437,8 +445,8 @@ async def test_window_count_semantics_for_threshold():
     
     assert results2[0].count == 6
     assert results2[0].exceeded
-    assert "tool_repetition" in new_ids2
-    assert set(new_ids2["tool_repetition"]) == {"evt-4", "evt-5", "evt-6"}
+    assert "tool_repetition:unknown" in new_ids2
+    assert set(new_ids2["tool_repetition:unknown"]) == {"evt-4", "evt-5", "evt-6"}
 
 @pytest.mark.asyncio
 async def test_evidence_extraction_from_events():
@@ -477,7 +485,7 @@ async def test_evidence_extraction_from_events():
         )
     
     assert len(results) == 1
-    assert results[0].metric_type == "tool_repetition"
+    assert results[0].metric_type == "tool_repetition:factorio_call_script(find_ore_basic)"
     
     # Evidence should be latest 5 (sorted by ts, newest first)
     evidence = results[0].evidence

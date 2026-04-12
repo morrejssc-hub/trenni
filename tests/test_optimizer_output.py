@@ -18,7 +18,9 @@ from yoitsu_contracts.review_proposal import (
 )
 from yoitsu_contracts.events import TriggerData
 from yoitsu_contracts.external_events import review_proposal_to_trigger
+from yoitsu_contracts.config import BundleSource, TargetSource
 from trenni.state import SupervisorState, SpawnedJob
+from trenni.workspace_manager import PreparedWorkspaces
 
 
 class TestOptimizerOutputHandling:
@@ -34,6 +36,15 @@ class TestOptimizerOutputHandling:
         config = TrenniConfig()
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="default", workspace="/tmp/bundle"),
+            target_source=TargetSource(workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         # Create optimizer job
         job_id = "optimizer-001"
@@ -96,6 +107,15 @@ class TestOptimizerOutputHandling:
         config = TrenniConfig()
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="default", workspace="/tmp/bundle"),
+            target_source=TargetSource(workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         # Create planner job (not optimizer)
         job_id = "planner-001"
@@ -137,6 +157,15 @@ class TestOptimizerOutputHandling:
         config = TrenniConfig()
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="default", workspace="/tmp/bundle"),
+            target_source=TargetSource(workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         # Create optimizer job
         job_id = "optimizer-002"
@@ -193,6 +222,15 @@ class TestOptimizerOutputHandling:
             bundle="default",
         )
         supervisor.state.jobs_by_id[job_id] = job
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="default", workspace="/tmp/bundle"),
+            target_source=TargetSource(workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         # Create completion event without summary
         event = SimpleNamespace(
@@ -278,11 +316,26 @@ Here is my proposal:
     async def test_optimizer_proposal_spawns_distinct_task_and_job_ids(self):
         """Proposal trigger should not reuse the optimizer task/job ids."""
         from trenni.supervisor import Supervisor
-        from trenni.config import TrenniConfig
+        from trenni.config import TrenniConfig, BundleConfig
 
-        config = TrenniConfig()
+        config = TrenniConfig(
+            bundles={
+                "factorio": BundleConfig.from_dict({
+                    "source": {"url": "https://github.com/test/factorio-bundle.git"}
+                })
+            }
+        )
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+            target_source=TargetSource(repo_uri="https://github.com/test/factorio-bundle.git", workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         optimizer_task_id = "9a77a7b31508b8ef"
         optimizer_job_id = f"{optimizer_task_id}-root"
@@ -349,11 +402,26 @@ Here is my proposal:
     async def test_optimizer_proposal_source_event_id_uses_completion_event_id(self):
         """Proposal lineage should be derived from the completion event id."""
         from trenni.supervisor import Supervisor
-        from trenni.config import TrenniConfig
+        from trenni.config import TrenniConfig, BundleConfig
 
-        config = TrenniConfig()
+        config = TrenniConfig(
+            bundles={
+                "factorio": BundleConfig.from_dict({
+                    "source": {"url": "https://github.com/test/factorio-bundle.git"}
+                })
+            }
+        )
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+            target_source=TargetSource(repo_uri="https://github.com/test/factorio-bundle.git", workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         optimizer_task_id = "9a77a7b31508b8ef"
         optimizer_job_id = f"{optimizer_task_id}-root"
@@ -473,15 +541,30 @@ class TestEndToEndOptimizationLoop:
         4. optimization task spawned
         """
         from trenni.supervisor import Supervisor
-        from trenni.config import TrenniConfig
+        from trenni.config import TrenniConfig, BundleConfig
         from yoitsu_contracts.external_events import (
             ObservationThresholdEvent,
             observation_threshold_to_trigger,
         )
 
-        config = TrenniConfig()
+        config = TrenniConfig(
+            bundles={
+                "default": BundleConfig.from_dict({
+                    "source": {"url": "https://github.com/test/default-bundle.git"}
+                })
+            }
+        )
         supervisor = Supervisor(config)
         supervisor.client = AsyncMock()
+        supervisor.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+            bundle_source=BundleSource(name="default", workspace="/tmp/bundle"),
+            target_source=TargetSource(workspace="/tmp/target"),
+            temp_dirs=[],
+        ))
+        supervisor.runtime_builder.build = MagicMock()
+        supervisor.backend.ensure_ready = AsyncMock()
+        supervisor.backend.prepare = AsyncMock()
+        supervisor.backend.start = AsyncMock()
 
         # Step 1: Observation threshold event
         threshold_event = ObservationThresholdEvent(

@@ -17,6 +17,8 @@ from trenni.pasloe_client import Event
 from trenni.runtime_types import ContainerState, JobHandle, JobRuntimeSpec
 from trenni.state import TaskRecord
 from trenni.supervisor import SpawnDefaults, SpawnedJob, Supervisor
+from trenni.workspace_manager import PreparedWorkspaces
+from yoitsu_contracts.config import BundleSource, TargetSource
 
 
 def _evt(id_: str, type_: str, data: dict | None = None) -> Event:
@@ -661,6 +663,11 @@ async def test_launch_emits_container_identity():
     sup.backend.ensure_ready = AsyncMock()
     sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock()
+    sup.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+        bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+        target_source=TargetSource(repo_uri="/repo", workspace="/tmp/target"),
+        temp_dirs=[],
+    ))
 
     await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
                       source_event_id="evt-src-123", bundle="factorio")
@@ -693,6 +700,11 @@ async def test_launch_removes_container_when_start_fails():
     sup.backend.prepare = AsyncMock(return_value=JobHandle("job-xyz", "ctr-9999", "yoitsu-job-job-xyz"))
     sup.backend.start = AsyncMock(side_effect=RuntimeError("boom"))
     sup.backend.remove = AsyncMock()
+    sup.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+        bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+        target_source=TargetSource(repo_uri="/repo", workspace="/tmp/target"),
+        temp_dirs=[],
+    ))
 
     with pytest.raises(RuntimeError):
         await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
@@ -740,6 +752,11 @@ async def test_launch_calls_ensure_ready_before_prepare():
     sup.backend.prepare = mock_prepare
     sup.backend.start = mock_start
     sup.client.emit = AsyncMock()
+    sup.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+        bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+        target_source=TargetSource(repo_uri="/repo", workspace="/tmp/target"),
+        temp_dirs=[],
+    ))
 
     await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
                       source_event_id="evt-src-123", bundle="factorio")
@@ -786,6 +803,11 @@ async def test_launch_propagates_ensure_ready_errors():
     sup.backend.ensure_ready = mock_ensure_ready
     sup.backend.prepare = mock_prepare
     sup.client.emit = AsyncMock()
+    sup.workspace_manager.prepare = MagicMock(return_value=PreparedWorkspaces(
+        bundle_source=BundleSource(name="factorio", workspace="/tmp/bundle"),
+        target_source=TargetSource(repo_uri="/repo", workspace="/tmp/target"),
+        temp_dirs=[],
+    ))
 
     with pytest.raises(RuntimeError, match="missing-pod"):
         await sup._launch("job-xyz", "test", "default", "/repo", "main", None,
