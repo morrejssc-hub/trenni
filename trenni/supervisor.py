@@ -457,7 +457,7 @@ class Supervisor:
         """Process a trigger event after validation.
 
         Shared logic for both direct triggers and external events.
-        Per Bundle MVP: bundle and role are required fields.
+        Per Bundle MVP: bundle is required; role defaults to bundle's default_role.
         """
         # goal is now required by pydantic (min_length=1), no need to check
 
@@ -478,18 +478,25 @@ class Supervisor:
                 replay=replay,
             )
             return
+
+        # Resolve role: explicit > bundle default > reject
         if not role:
-            await self._reject_task_submission(
-                task_id=task_id,
-                bundle=bundle,
-                goal=data.goal,
-                source_trigger_id=event.id,
-                reason="Trigger missing role field",
-                role="",
-                budget=data.budget,
-                replay=replay,
-            )
-            return
+            bundle_config = self.config.bundles.get(bundle)
+            if bundle_config and bundle_config.default_role:
+                role = bundle_config.default_role
+                logger.info(f"Using default_role '{role}' for bundle '{bundle}'")
+            else:
+                await self._reject_task_submission(
+                    task_id=task_id,
+                    bundle=bundle,
+                    goal=data.goal,
+                    source_trigger_id=event.id,
+                    reason=f"Trigger missing role field and bundle '{bundle}' has no default_role configured",
+                    role="",
+                    budget=data.budget,
+                    replay=replay,
+                )
+                return
 
         self.scheduler.record_task_submission(
             task_id=task_id,
@@ -1859,16 +1866,6 @@ class Supervisor:
         if not trigger_data.get("bundle") and job.bundle:
             trigger_data["bundle"] = job.bundle
         
-        # ADR-0015: implementer writes to bundle repo, set repo=bundle_repo_url
-        # This enables WorkspaceManager to create target_source for implementer
-        if trigger_data.get("role") == "implementer":
-            bundle_name = trigger_data.get("bundle", "")
-            bundle_config = self.config.bundles.get(bundle_name)
-            if bundle_config and bundle_config.source.url:
-                # Set repo and init_branch so implementer has a target workspace
-                trigger_data["repo"] = bundle_config.source.url
-                trigger_data["init_branch"] = bundle_config.source.selector
-
         # Create synthetic event for _process_trigger
         proposal_source_event_id = f"{event.id}-proposal"
         synthetic_event = SimpleNamespace(

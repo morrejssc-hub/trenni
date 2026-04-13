@@ -122,9 +122,10 @@ class TestBundleConfig:
         config = BundleConfig()
         assert isinstance(config.runtime, BundleRuntimeConfig)
         assert isinstance(config.scheduling, BundleSchedulingConfig)
+        assert config.default_role == ""
 
     def test_from_dict_with_all_sections(self):
-        """BundleConfig.from_dict should parse runtime and scheduling."""
+        """BundleConfig.from_dict should parse runtime, scheduling, and default_role."""
         data = {
             "runtime": {
                 "image": "bundle-image:latest",
@@ -133,6 +134,7 @@ class TestBundleConfig:
                 "extra_networks": ["bundle-net"],
             },
             "scheduling": {"max_concurrent_jobs": 3},
+            "default_role": "planner",
         }
         config = BundleConfig.from_dict(data)
         assert config.runtime.image == "bundle-image:latest"
@@ -140,6 +142,7 @@ class TestBundleConfig:
         assert config.runtime.env_allowlist == ["BUNDLE_VAR"]
         assert config.runtime.extra_networks == ["bundle-net"]
         assert config.scheduling.max_concurrent_jobs == 3
+        assert config.default_role == "planner"
 
     def test_from_dict_with_none(self):
         """BundleConfig.from_dict should handle None input."""

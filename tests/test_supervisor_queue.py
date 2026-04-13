@@ -140,7 +140,8 @@ async def test_handle_trigger_missing_bundle_rejected():
 
 @pytest.mark.asyncio
 async def test_handle_trigger_missing_role_rejected():
-    """Per Bundle MVP: trigger without role is rejected."""
+    """Per Bundle MVP: trigger without role is rejected if bundle has no default_role."""
+    # factorio bundle in _make_supervisor() has no default_role
     sup = _make_supervisor()
     sup.client.emit = AsyncMock()
     event = _evt("evt-no-role", "trigger.external.received",
@@ -149,6 +150,31 @@ async def test_handle_trigger_missing_role_rejected():
     await sup._handle_trigger(event)
 
     assert sup._ready_queue.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_trigger_missing_role_uses_default_role():
+    """Trigger without role uses bundle's default_role if configured."""
+    sup = _make_supervisor(
+        bundles={
+            "factorio": BundleConfig.from_dict(
+                {
+                    "source": {"url": "https://github.com/guan-spicy-wolf/factorio-bundle.git"},
+                    "default_role": "planner",
+                }
+            )
+        },
+    )
+    sup.client.emit = AsyncMock()
+    event = _evt("evt-no-role", "trigger.external.received",
+                 {"goal": "do X", "bundle": "factorio"})
+
+    await sup._handle_trigger(event)
+
+    # Should be enqueued with role=planner
+    assert sup._ready_queue.qsize() == 1
+    job = sup._ready_queue.get_nowait()
+    assert job.role == "planner"
 
 
 @pytest.mark.asyncio

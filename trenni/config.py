@@ -110,10 +110,12 @@ class BundleConfig:
         source: Where the bundle repo is and which ref to track
         runtime: Container runtime settings for jobs using this bundle
         scheduling: Concurrency and scheduling settings
+        default_role: Entry role for tasks without explicit role (e.g., "planner")
     """
     source: BundleSourceConfig = field(default_factory=BundleSourceConfig)
     runtime: BundleRuntimeConfig = field(default_factory=BundleRuntimeConfig)
     scheduling: BundleSchedulingConfig = field(default_factory=BundleSchedulingConfig)
+    default_role: str = ""  # Entry role for external triggers without role field
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "BundleConfig":
@@ -122,6 +124,7 @@ class BundleConfig:
             source=BundleSourceConfig.from_dict(payload.get("source")),
             runtime=BundleRuntimeConfig.from_dict(payload.get("runtime")),
             scheduling=BundleSchedulingConfig.from_dict(payload.get("scheduling")),
+            default_role=payload.get("default_role", ""),
         )
 
 
