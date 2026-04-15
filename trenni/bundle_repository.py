@@ -30,9 +30,14 @@ class BundleRepositoryManager:
     BUNDLES_DIR = Path("~/trenni/bundles").expanduser()
 
     bundles: dict[str, str] = field(default_factory=dict)  # bundle_name -> repo_url
+    # Worktrees are created here so job containers (separate podman containers)
+    # can bind-mount them. Must be a host-visible path, not /tmp inside the
+    # container (which is not bind-mounted to the host).
+    workspace_root: Path = field(default_factory=lambda: Path(tempfile.gettempdir()))
 
     def __post_init__(self) -> None:
         self.BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
 
     def ensure_bare_clone(self, bundle: str, url: str) -> Path:
         """Ensure a bare clone exists for the bundle.
@@ -155,8 +160,9 @@ class BundleRepositoryManager:
         if not bare_path.is_dir():
             raise ValueError(f"No bare clone for bundle {bundle}")
 
-        # Create unique worktree directory
-        worktree_base = Path(tempfile.mkdtemp(prefix=f"{prefix}-{bundle}-"))
+        # Create unique worktree directory under workspace_root so the path is
+        # visible on the host and can be bind-mounted into job containers.
+        worktree_base = Path(tempfile.mkdtemp(prefix=f"{prefix}-{bundle}-", dir=self.workspace_root))
         logger.debug(f"Creating worktree for {bundle}@{sha} at {worktree_base}")
 
         subprocess.run(

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from .runtime_types import ContainerExit, ContainerState, JobHandle, JobRuntimeSpec, RuntimeDefaults
+
+logger = logging.getLogger(__name__)
 
 
 class PodmanBackend:
@@ -209,8 +212,23 @@ class PodmanBackend:
         client = await self._get_client()
         response = await client.request(method, path, **kwargs)
         if expected is not None and response.status_code not in expected:
+            logger.error(
+                "Podman %s %s -> %s: %s",
+                method,
+                path,
+                response.status_code,
+                response.text[:2000],
+            )
             response.raise_for_status()
         elif expected is None:
+            if not response.is_success:
+                logger.error(
+                    "Podman %s %s -> %s: %s",
+                    method,
+                    path,
+                    response.status_code,
+                    response.text[:2000],
+                )
             response.raise_for_status()
         return response
 

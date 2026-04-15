@@ -134,7 +134,7 @@ PASLOE_DB="$WORK_DIR/events.db"
 
 # ── 启动 Pasloe ──────────────────────────────────────────────────────
 info "启动 Pasloe (port=$PASLOE_PORT)..."
-SQLITE_PATH="$PASLOE_DB" ALLOW_INSECURE_HTTP=True \
+db_type=sqlite SQLITE_PATH="$PASLOE_DB" ALLOW_INSECURE_HTTP=True \
     uvicorn pasloe.app:app --host "$PASLOE_HOST" --port "$PASLOE_PORT" \
     > "$WORK_DIR/pasloe.log" 2>&1 &
 PASLOE_PID=$!

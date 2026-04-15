@@ -51,9 +51,10 @@ class WorkspaceManager:
         bundle_repo_manager: BundleRepositoryManager | None = None,
     ) -> None:
         self.config = config
-        self.bundle_repo = bundle_repo_manager or BundleRepositoryManager()
-        # Must be visible to both the Trenni container and the host Podman daemon.
         self._base_dir = Path(config.workspace_root or "/tmp/yoitsu-workspaces")
+        self.bundle_repo = bundle_repo_manager or BundleRepositoryManager(
+            workspace_root=self._base_dir,
+        )
         self._base_dir.mkdir(parents=True, exist_ok=True)
 
     def _is_same_bundle_repo(
@@ -187,9 +188,11 @@ class WorkspaceManager:
             return None, None
 
         # Create worktree (RO for code loading)
+        # Per ADR-0020: Child task IDs use '/' as hierarchy separator (e.g. "abc123/fv7o-eval").
+        # Replace '/' with '-' in prefix to avoid nested directory creation in tempfile.mkdtemp.
         try:
             worktree = self.bundle_repo.create_worktree(
-                bundle, sha, writable=False, prefix=f"bundle-{job_id}"
+                bundle, sha, writable=False, prefix=f"bundle-{job_id.replace('/', '-')}"
             )
         except Exception as e:
             logger.error(f"Failed to create bundle worktree for {bundle}: {e}")
@@ -235,9 +238,10 @@ class WorkspaceManager:
             return None, None
 
         # Create RW worktree at branch (not SHA) to avoid detached HEAD
+        # Per ADR-0020: Replace '/' in job_id to avoid nested directory creation.
         try:
             worktree = self.bundle_repo.create_worktree(
-                bundle, sha, writable=True, prefix=f"target-{job_id}"
+                bundle, sha, writable=True, prefix=f"target-{job_id.replace('/', '-')}"
             )
             # Materialize a local branch from the fetched remote ref so plain
             # `git push` works from finalize().

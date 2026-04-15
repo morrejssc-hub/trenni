@@ -107,7 +107,9 @@ class Supervisor:
         self.spawn_handler = SpawnHandler(self.state)
         self.workspace_manager = WorkspaceManager(config)  # ADR-0015: clone bundle/target
         # ADR-0021: Control-plane capability execution
-        self.bundle_repo_manager = BundleRepositoryManager()
+        self.bundle_repo_manager = BundleRepositoryManager(
+            workspace_root=Path(config.workspace_root),
+        )
         self.control_plane_executor = ControlPlaneExecutor()
 
         self._checkpoint_cycles = _DEFAULT_CHECKPOINT_CYCLES
@@ -286,6 +288,13 @@ class Supervisor:
         while True:
             await self._resume_event.wait()
             job = await self._ready_queue.get()
+
+            # Skip jobs that were already resolved (e.g. enqueued then failed before
+            # launch during a previous run; replay re-queues them but also marks them
+            # terminal, so they must not be relaunched).
+            if job.job_id in self.state.completed_jobs or job.job_id in self.state.cancelled_jobs:
+                logger.debug("Skipping already-terminal job %s from queue", job.job_id)
+                continue
 
             evaluation = self.scheduler.evaluate_job(job)
             if evaluation is False:
