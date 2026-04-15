@@ -20,7 +20,7 @@ from trenni.runtime_types import ContainerState, JobHandle, JobRuntimeSpec
 from trenni.state import TaskRecord
 from trenni.supervisor import SpawnDefaults, SpawnedJob, Supervisor
 from trenni.workspace_manager import PreparedWorkspaces
-from yoitsu_contracts.config import BundleSource, TargetSource
+from yoitsu_contracts.config import BundleSource, JobContextConfig, JoinContextConfig, TargetSource
 
 
 def _evt(id_: str, type_: str, data: dict | None = None) -> Event:
@@ -350,6 +350,58 @@ def test_spawn_handler_join_job_uses_continuation_instruction():
     # Per ADR-0007: role_params only has mode="join"
     assert join_job.role_params["mode"] == "join"
     assert join_job.job_context.join.parent_summary == "Parent goal"
+
+
+def test_spawn_handler_join_job_preserves_original_parent_summary():
+    sup = _make_supervisor()
+    continuation_goal = (
+        "Review the completed child tasks for the parent goal below.\n\n"
+        "This is a continuation planning step, not a fresh planning pass.\n\n"
+        "Parent goal:\nParent goal"
+    )
+    parent = SpawnedJob(
+        "parent-join-1",
+        "e2",
+        continuation_goal,
+        "planner",
+        "/repo",
+        "main",
+        "sha1",
+        role_params={"mode": "join"},
+        task_id="root-task",
+        job_context=JobContextConfig(
+            join=JoinContextConfig(
+                parent_job_id="parent-0",
+                parent_task_id="root-task",
+                parent_summary="Parent goal",
+                child_task_ids=["root-task/a1"],
+            )
+        ),
+    )
+    sup.state.jobs_by_id["parent-join-1"] = parent
+    sup.state.spawn_defaults_by_job["parent-join-1"] = SpawnDefaults(
+        repo="/repo",
+        init_branch="main",
+        role="planner",
+        bundle_sha="sha1",
+        role_params={"mode": "join"},
+        task_id="root-task",
+    )
+
+    event = _evt("spawn-join-2", "agent.job.spawn_request", {
+        "job_id": "parent-join-1",
+        "task_id": "root-task",
+        "tasks": [
+            {"goal": "follow-up child", "role": "evaluator", "bundle": "factorio", "repo": "/repo", "init_branch": "main"},
+        ],
+    })
+
+    plan = sup.spawn_handler.expand(event)
+    join_jobs = [job for job in plan.jobs if job.job_context.join is not None]
+    assert len(join_jobs) == 1
+    join_job = join_jobs[0]
+    assert join_job.job_context.join.parent_summary == "Parent goal"
+    assert join_job.goal.count("Parent goal:") == 1
 
 
 @pytest.mark.asyncio

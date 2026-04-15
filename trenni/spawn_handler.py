@@ -161,7 +161,8 @@ class SpawnHandler:
 
         if parent_job is not None and child_task_ids:
             join_token = self._id_hash(f"{parent_task_id}:{event.id}:join")
-            join_task = self._join_task_instruction(parent_job.goal)
+            parent_summary = self._parent_summary_for_join(parent_job)
+            join_task = self._join_task_instruction(parent_summary)
 
             # join role_params contains only mode="join"
             # parent_goal goes to JobContextConfig.join.parent_summary
@@ -184,7 +185,7 @@ class SpawnHandler:
                         join=JoinContextConfig(
                             parent_job_id=parent_job_id,
                             parent_task_id=parent_job.task_id or payload.task_id or parent_job.job_id,
-                            parent_summary=parent_job.goal,
+                            parent_summary=parent_summary,
                             child_task_ids=child_task_ids,
                         )
                     ),
@@ -235,6 +236,20 @@ class SpawnHandler:
             "Do not recreate work that child tasks have already completed.\n\n"
             f"Parent goal:\n{parent_goal}"
         )
+
+    @staticmethod
+    def _parent_summary_for_join(parent_job: SpawnedJob) -> str:
+        """Preserve the original parent goal across continuation loops.
+
+        When a join-mode planner spawns follow-up tasks, parent_job.goal already
+        contains the continuation wrapper text. Reusing that as parent_summary
+        causes nested "Parent goal" recursion on each loop.
+        """
+        join_ctx = getattr(parent_job.job_context, "join", None) if parent_job.job_context else None
+        inherited = str(getattr(join_ctx, "parent_summary", "") or "").strip()
+        if inherited:
+            return inherited
+        return str(parent_job.goal or "")
 
     @staticmethod
     def _inherit(name: str, parent_job: SpawnedJob | None, defaults: SpawnDefaults | None, fallback):
